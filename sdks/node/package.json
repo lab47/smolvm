@@ -9,7 +9,8 @@
     "smoke": "./scripts/smoke-install.sh"
   },
   "workspaces": [
-    "smolvm-embedded"
+    "smolvm-embedded",
+    "smolvm-e2b"
   ],
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",

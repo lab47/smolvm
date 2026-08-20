@@ -8,11 +8,20 @@ service APIs.
 Layout convention:
 
 - `sdks/scripts/` contains shared helpers used by all embedded SDKs.
-- `sdks/node/` contains the Node.js embedded SDK and its internal platform
-  packages.
+- `sdks/node/` contains the Node.js embedded SDK (`smolvm-embedded`) and its
+  internal platform packages, plus `smolvm-e2b` — a service-API SDK (below).
 - `sdks/python/` contains the dependency-free fused rollout API client used by
   training frameworks.
 - Future embedded SDKs should live in sibling directories such as `sdks/go/`, and `sdks/c/`.
+
+### `@smolvm/e2b` — a self-hosted [e2b](https://e2b.dev)-shaped SDK
+
+`sdks/node/smolvm-e2b/` is a **service-API** SDK (not embedded): a dependency-free
+HTTP client for a `smolvm serve` control plane that presents an e2b-style
+`Sandbox` surface (`Sandbox.create`, `commands.run`, `files`, `setTimeout`,
+`pause`/`resume`, `connect`, `kill`). Its headline features are **auto-idle** and
+**warm resume** — a sandbox auto-pauses after an idle window and resumes with its
+full RAM and running processes intact. See `sdks/node/smolvm-e2b/README.md`.
 
 Bundled native library rule:
 
