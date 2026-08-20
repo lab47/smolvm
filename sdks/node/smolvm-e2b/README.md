@@ -75,9 +75,25 @@ Every entry point accepts connection options (or reads `SMOLVM_API_URL` / `SMOLV
   - `cmd` is a shell string (run via `sh -c`) or an argv array (run directly).
   - `opts`: `cwd`, `envs`, `timeoutMs`, `stdin`, `background`, `throwOnError` (default `true`), `onStdout`, `onStderr`.
   - Pass `onStdout`/`onStderr` to **stream** output live as it arrives; the call still resolves with the full `{ exitCode, stdout, stderr }`.
-  - `{ background: true }` returns `{ pid }` immediately for long-lived daemons.
+  - `{ background: true }` returns a `CommandHandle` (see below) for a long-lived process.
+- `connect(pid, { onStdout, onStderr })` — reattach to a running background process by pid.
 - `list()` — processes running in the sandbox (`{ pid, cmd }[]`).
 - `kill(pid, signal?)` — signal a process (`signal` defaults to `TERM`).
+
+A **`CommandHandle`** (from `run({ background:true })` or `connect`) has:
+- `pid`, `wait()` → resolves with `{ exitCode, stdout, stderr }` when the process exits,
+- `kill(signal?)`, `sendStdin(data)`, `disconnect()` (stop streaming; process keeps running).
+
+```ts
+const server = await sbx.commands.run("python -m http.server 8000", {
+  background: true,
+  onStdout: (l) => console.log(l),
+});
+// ...later
+await server.kill();
+```
+
+Background processes run under a small in-guest supervisor (stdio to files + a stdin FIFO), and streaming/`wait` **poll** by tailing — so output is near-real-time, not instantaneous.
 
 ```ts
 await sbx.commands.run("npm run build", {

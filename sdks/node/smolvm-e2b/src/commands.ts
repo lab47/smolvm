@@ -1,17 +1,23 @@
+import { connectBackground, startBackground } from "./background.js";
 import type { Client } from "./client.js";
 import { CommandExitError } from "./errors.js";
 import type {
-  BackgroundCommandHandle,
+  BackgroundStreamOpts,
+  CommandHandle,
   CommandOpts,
   CommandResult,
   ProcessInfo,
 } from "./types.js";
 
+/** Single-quote an argv element for safe use in a `sh -c` command string. */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 interface ExecResponseJson {
   exitCode: number;
   stdout: string;
   stderr: string;
-  pid?: number;
 }
 
 function envList(envs?: Record<string, string>): Array<{ name: string; value: string }> {
@@ -32,11 +38,24 @@ export class Commands {
    * @param cmd A shell string (run via `sh -c`) or an argv array (run directly).
    */
   async run(cmd: string | string[], opts?: CommandOpts & { background?: false }): Promise<CommandResult>;
-  async run(cmd: string | string[], opts: CommandOpts & { background: true }): Promise<BackgroundCommandHandle>;
+  async run(cmd: string | string[], opts: CommandOpts & { background: true }): Promise<CommandHandle>;
   async run(
     cmd: string | string[],
     opts: CommandOpts = {},
-  ): Promise<CommandResult | BackgroundCommandHandle> {
+  ): Promise<CommandResult | CommandHandle> {
+    // Background: run under the in-guest supervisor so the process is
+    // streamable, awaitable, killable, and reconnectable (a richer handle than
+    // the fire-and-forget /exec background path).
+    if (opts.background) {
+      const cmdStr = Array.isArray(cmd) ? cmd.map(shellQuote).join(" ") : cmd;
+      return startBackground(this, cmdStr, {
+        envs: opts.envs,
+        cwd: opts.cwd,
+        onStdout: opts.onStdout,
+        onStderr: opts.onStderr,
+      });
+    }
+
     const command = Array.isArray(cmd) ? cmd : ["sh", "-c", cmd];
     const body = {
       command,
@@ -94,17 +113,6 @@ export class Commands {
       json: body,
       timeoutMs,
     });
-
-    if (opts.background) {
-      // The control plane returns the detached PID either as a `pid` field or
-      // embedded in stdout as "pid=<N>".
-      let pid = res.pid;
-      if (pid === undefined) {
-        const m = /pid=(\d+)/.exec(res.stdout ?? "");
-        if (m) pid = Number(m[1]);
-      }
-      return { pid };
-    }
     const result: CommandResult = {
       exitCode: res.exitCode,
       stdout: res.stdout ?? "",
@@ -114,6 +122,12 @@ export class Commands {
       throw new CommandExitError(result.exitCode, result.stdout, result.stderr);
     }
     return result;
+  }
+
+  /** Reattach to a managed background process by pid (started via
+   * `run({ background:true })`), streaming its output and allowing wait/kill. */
+  async connect(pid: number, opts: BackgroundStreamOpts = {}): Promise<CommandHandle> {
+    return connectBackground(this, pid, opts);
   }
 
   /** List processes running inside the sandbox (`{ pid, cmd }`), read from /proc. */

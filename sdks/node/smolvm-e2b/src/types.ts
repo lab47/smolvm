@@ -80,6 +80,32 @@ export interface BackgroundCommandHandle {
   pid?: number;
 }
 
+/**
+ * A live handle to a background process (from `commands.run({ background:true })`
+ * or `commands.connect(pid)`). Lets you stream its output, await its exit, send
+ * it stdin, and kill it.
+ */
+export interface CommandHandle {
+  /** PID of the process inside the sandbox. */
+  readonly pid: number;
+  /** Await the process's exit; resolves with the full captured output + code. */
+  wait(): Promise<CommandResult>;
+  /** Signal the process (`signal` defaults to `TERM`). */
+  kill(signal?: string): Promise<boolean>;
+  /** Write bytes to the process's stdin. */
+  sendStdin(data: string | Uint8Array): Promise<void>;
+  /** Stop streaming/awaiting from this handle; the process keeps running. */
+  disconnect(): void;
+}
+
+/** Options for streaming a background process's output. */
+export interface BackgroundStreamOpts {
+  onStdout?: (data: string) => void;
+  onStderr?: (data: string) => void;
+  /** Poll interval for tailing output/exit, in ms (default 300). */
+  pollMs?: number;
+}
+
 /** A process running inside the sandbox, from {@link Commands.list}. */
 export interface ProcessInfo {
   pid: number;
