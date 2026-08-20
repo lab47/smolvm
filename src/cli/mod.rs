@@ -8,6 +8,7 @@ pub mod openapi;
 pub mod pack;
 pub mod pack_run;
 pub mod parsers;
+pub mod proxy;
 pub mod proxy_opts;
 pub mod serve;
 pub mod serve_tls;

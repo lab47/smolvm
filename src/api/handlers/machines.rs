@@ -63,6 +63,16 @@ use crate::Error as SmolvmError;
 use crate::agent::state_probe::resolve_state as resolve_machine_state;
 
 /// Convert VmRecord to MachineInfo (pure mapping, no I/O).
+/// Grab a currently-free host TCP port by binding `127.0.0.1:0` and reading back
+/// the OS-assigned port. The listener is dropped immediately, so there is a small
+/// TOCTOU window before the VM binds it — the control plane already retries the
+/// resulting `PORT_IN_USE`. Used to auto-allocate a host port for a published
+/// guest port whose `host` was left 0.
+fn allocate_free_host_port() -> std::io::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
 fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     let actual_state = resolve_machine_state(name, record);
     // Clear stale PID when the process is not actually running, so clients
@@ -420,15 +430,30 @@ pub async fn create_machine(
     // launch): port 0 is invalid for forwarding, and each host port may be
     // mapped only once — two guest ports on one host port can't both bind, so
     // reject it as a clean 400 rather than an ambiguous mid-boot bind failure.
+    // A `host` of 0 means "auto-allocate": the caller only cares about exposing
+    // the guest port (e.g. the SDK's `ports: [3000]` / the preview proxy), and
+    // the reachable host port is an internal detail resolved from MachineInfo.
+    // Bind :0 to grab a free port; the control plane retries the rare
+    // PORT_IN_USE race. `guest` 0 stays invalid.
+    let mut resolved_ports: Vec<PortSpec> = Vec::with_capacity(req.ports.len());
     for p in &req.ports {
-        if p.host == 0 || p.guest == 0 {
+        if p.guest == 0 {
             return Err(ApiError::BadRequest(
-                "port 0 is not valid for VM port forwarding".to_string(),
+                "guest port 0 is not valid for VM port forwarding".to_string(),
             ));
         }
+        let host = if p.host == 0 {
+            allocate_free_host_port()
+                .map_err(|e| ApiError::internal(format!("allocate host port: {e}")))?
+        } else {
+            p.host
+        };
+        resolved_ports.push(PortSpec {
+            host,
+            guest: p.guest,
+        });
     }
-    let port_mappings: Vec<PortMapping> = req
-        .ports
+    let port_mappings: Vec<PortMapping> = resolved_ports
         .iter()
         .map(|p| PortMapping::new(p.host, p.guest))
         .collect();
@@ -778,7 +803,7 @@ pub async fn create_machine(
     let complete_result = guard.complete(MachineRegistration {
         manager,
         mounts: req.mounts.clone(),
-        ports: req.ports.clone(),
+        ports: resolved_ports.clone(),
         resources: resources.clone(),
         restart: match req.restart {
             Some(ref spec) => {

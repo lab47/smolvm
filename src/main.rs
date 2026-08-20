@@ -36,6 +36,9 @@ enum Commands {
     #[command(subcommand)]
     Pack(Box<cli::pack::PackCmd>),
 
+    /// Run an e2b-style preview reverse proxy for sandbox ports
+    Proxy(cli::proxy::ProxyCmd),
+
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
@@ -169,6 +172,7 @@ fn main() {
         Commands::Machine(cmd) => (*cmd).run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
+        Commands::Proxy(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
         #[cfg(unix)]
