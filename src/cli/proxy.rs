@@ -12,7 +12,9 @@
 //! and tunnels to `127.0.0.1:<hostPort>`.
 
 use clap::Args;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 
@@ -71,6 +73,7 @@ impl ProxyCmd {
             api_key: self.api_key.clone(),
             auto_resume: self.auto_resume,
             upstream_host,
+            last_touch: Mutex::new(HashMap::new()),
         });
 
         let listener = TcpListener::bind(&self.listen).await.map_err(Error::Io)?;
@@ -104,6 +107,9 @@ struct ProxyConfig {
     api_key: Option<String>,
     auto_resume: bool,
     upstream_host: String,
+    /// Per-sandbox time of the last auto-idle refresh, so a busy proxy touches
+    /// the control plane at most once per `TOUCH_INTERVAL` rather than per request.
+    last_touch: Mutex<HashMap<String, Instant>>,
 }
 
 /// How to reach the serve API: a Unix socket or a TCP host:port.
@@ -136,6 +142,10 @@ fn default_serve_url() -> String {
 
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const RESUME_READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Minimum spacing between auto-idle refreshes for one sandbox. Far below any
+/// sane idle window, so live traffic keeps a sandbox up without a per-request DB
+/// write.
+const TOUCH_INTERVAL: Duration = Duration::from_secs(15);
 
 async fn handle_conn(mut client: TcpStream, cfg: std::sync::Arc<ProxyConfig>) -> Result<()> {
     // Read the request head (up to the blank line) so we can route on Host. The
@@ -196,6 +206,11 @@ async fn handle_conn(mut client: TcpStream, cfg: std::sync::Arc<ProxyConfig>) ->
         }
     };
 
+    // Treat the request as activity: refresh the sandbox's auto-idle deadline so
+    // live traffic keeps it running (matching e2b). Throttled and fire-and-forget
+    // so it never adds latency to the proxied request.
+    maybe_touch(&cfg, &sandbox_id);
+
     // Connect to the sandbox's published port and tunnel. Replay the head we
     // already read, then bidirectionally copy — this transparently carries HTTP
     // keep-alive and WebSocket upgrades on the same connection.
@@ -217,6 +232,30 @@ enum RouteError {
     Paused,
     PortNotPublished,
     Upstream(String),
+}
+
+/// Refresh the sandbox's auto-idle deadline (via `POST /{id}/touch`) at most once
+/// per [`TOUCH_INTERVAL`], off the request path. The control plane no-ops the
+/// touch for a sandbox without an idle window, so this is safe to always call.
+fn maybe_touch(cfg: &std::sync::Arc<ProxyConfig>, sandbox_id: &str) {
+    {
+        let mut map = cfg.last_touch.lock().unwrap();
+        let now = Instant::now();
+        match map.get(sandbox_id) {
+            Some(last) if now.duration_since(*last) < TOUCH_INTERVAL => return,
+            _ => {
+                map.insert(sandbox_id.to_string(), now);
+            }
+        }
+    }
+    let cfg = cfg.clone();
+    let id = sandbox_id.to_string();
+    tokio::spawn(async move {
+        let path = format!("/api/v1/machines/{}/touch", urlencode(&id));
+        if let Err(e) = serve_api(&cfg, "POST", &path, None).await {
+            tracing::debug!(sandbox = %id, error = %e, "idle-touch failed");
+        }
+    });
 }
 
 async fn resolve_upstream(

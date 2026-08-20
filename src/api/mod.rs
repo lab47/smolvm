@@ -273,6 +273,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/pause", post(handlers::machines::pause_machine))
         .route("/{id}/resume", post(handlers::machines::resume_machine))
         .route("/{id}/timeout", post(handlers::machines::set_timeout_machine))
+        .route("/{id}/touch", post(handlers::machines::touch_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))

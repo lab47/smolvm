@@ -1620,6 +1620,18 @@ pub async fn set_timeout_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// `POST /{id}/touch` — refresh the machine's auto-idle deadline from activity
+/// (the preview proxy calls this per request so an actively-served sandbox is not
+/// paused out from under live traffic). No-op for a machine without an idle
+/// window. Returns 204.
+pub async fn touch_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> axum::http::StatusCode {
+    touch_idle_deadline(&state, &name).await;
+    axum::http::StatusCode::NO_CONTENT
+}
+
 /// Refresh a machine's auto-idle deadline to `now + idle_timeout_secs`, if it has
 /// an idle window configured. Called on activity (exec/files) so a busy sandbox
 /// is not paused out from under its caller. Best-effort and cheap; a machine
