@@ -148,6 +148,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // measured from the data dir regardless of whether the VMM is running.
         disk_used_mb: crate::agent::disk_used_mb(name),
         created_at: record.created_at,
+        metadata: record.metadata.clone(),
     }
 }
 
@@ -857,15 +858,27 @@ pub async fn create_machine(
         return Err(e);
     }
 
-    // Persist the auto-idle window (e2b sandbox timeout). The deadline itself is
-    // armed when the machine reaches Running (create may or may not auto-start).
-    if let Some(secs) = req.timeout_secs.filter(|s| *s > 0) {
+    // Persist the auto-idle window (e2b sandbox timeout), its on-expiry action,
+    // and any user metadata. The deadline itself is armed when the machine
+    // reaches Running (create may or may not auto-start).
+    let timeout_secs = req.timeout_secs.filter(|s| *s > 0);
+    let on_idle = req.on_idle.clone();
+    let metadata = req.metadata.clone();
+    if timeout_secs.is_some() || on_idle.is_some() || !metadata.is_empty() {
         let now = crate::util::current_timestamp();
         let _ = state
             .update_vm(&name, move |r| {
-                r.idle_timeout_secs = Some(secs);
-                if r.state == RecordState::Running {
-                    r.idle_deadline = Some(now + secs);
+                if let Some(secs) = timeout_secs {
+                    r.idle_timeout_secs = Some(secs);
+                    if r.state == RecordState::Running {
+                        r.idle_deadline = Some(now + secs);
+                    }
+                }
+                if on_idle.is_some() {
+                    r.idle_action = on_idle;
+                }
+                if !metadata.is_empty() {
+                    r.metadata = metadata;
                 }
             })
             .await;

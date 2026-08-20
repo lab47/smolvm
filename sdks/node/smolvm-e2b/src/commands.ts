@@ -1,6 +1,11 @@
 import type { Client } from "./client.js";
 import { CommandExitError } from "./errors.js";
-import type { BackgroundCommandHandle, CommandOpts, CommandResult } from "./types.js";
+import type {
+  BackgroundCommandHandle,
+  CommandOpts,
+  CommandResult,
+  ProcessInfo,
+} from "./types.js";
 
 interface ExecResponseJson {
   exitCode: number;
@@ -109,5 +114,35 @@ export class Commands {
       throw new CommandExitError(result.exitCode, result.stdout, result.stderr);
     }
     return result;
+  }
+
+  /** List processes running inside the sandbox (`{ pid, cmd }`), read from /proc. */
+  async list(): Promise<ProcessInfo[]> {
+    const res = await this.run(
+      [
+        "sh",
+        "-c",
+        'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; ' +
+          'cmd=$(tr "\\0" " " < "$p/cmdline"); printf "%s\\t%s\\n" "$pid" "$cmd"; done',
+      ],
+      { throwOnError: false },
+    );
+    return res.stdout
+      .split("\n")
+      .filter((l) => l.includes("\t"))
+      .map((l) => {
+        const tab = l.indexOf("\t");
+        return { pid: Number(l.slice(0, tab)), cmd: l.slice(tab + 1).trim() };
+      })
+      .filter((p) => Number.isFinite(p.pid) && p.pid > 0);
+  }
+
+  /** Kill a process inside the sandbox by pid. Returns whether the signal was
+   * delivered. `signal` defaults to `TERM`; pass `"KILL"` for a hard kill. */
+  async kill(pid: number, signal: string = "TERM"): Promise<boolean> {
+    const res = await this.run(["kill", `-${signal}`, String(pid)], {
+      throwOnError: false,
+    });
+    return res.exitCode === 0;
   }
 }

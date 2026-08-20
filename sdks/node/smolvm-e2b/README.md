@@ -60,10 +60,10 @@ Every entry point accepts connection options (or reads `SMOLVM_API_URL` / `SMOLV
 ## API
 
 ### Lifecycle
-- `Sandbox.create(opts)` — create **and start** a sandbox; returns a `Sandbox`.
+- `Sandbox.create(opts)` — create **and start** a sandbox; returns a `Sandbox`. `opts` includes `template`, `timeoutMs`, `onTimeout` (`"pause" | "stop" | "kill"`, default `pause`), `metadata`, `envs`, `ports`, `previewDomain`, `cpus`, `memoryMb`.
 - `Sandbox.connect(sandboxId, opts)` — reattach to a running sandbox.
 - `Sandbox.resume(sandboxId, opts)` — resume a paused sandbox (running processes survive).
-- `Sandbox.list(opts)` — list all sandboxes.
+- `Sandbox.list(opts)` — list sandboxes; pass `{ metadata: {...} }` to filter by labels.
 - `Sandbox.kill(sandboxId, opts)` — delete by id (static).
 - `sbx.pause()` — suspend to disk, free compute; returns the `sandboxId`.
 - `sbx.setTimeout(ms)` — set/extend the auto-idle window (`0` disables).
@@ -76,6 +76,8 @@ Every entry point accepts connection options (or reads `SMOLVM_API_URL` / `SMOLV
   - `opts`: `cwd`, `envs`, `timeoutMs`, `stdin`, `background`, `throwOnError` (default `true`), `onStdout`, `onStderr`.
   - Pass `onStdout`/`onStderr` to **stream** output live as it arrives; the call still resolves with the full `{ exitCode, stdout, stderr }`.
   - `{ background: true }` returns `{ pid }` immediately for long-lived daemons.
+- `list()` — processes running in the sandbox (`{ pid, cmd }[]`).
+- `kill(pid, signal?)` — signal a process (`signal` defaults to `TERM`).
 
 ```ts
 await sbx.commands.run("npm run build", {
@@ -100,6 +102,7 @@ await pty.exited;
 - `write(path, data)` — `data` is a string or `Uint8Array`.
 - `read(path, { format })` — `"text"` (default) → `string`, `"bytes"` → `Buffer`.
 - `list(dir)`, `remove(path)`, `rename(from, to)`, `exists(path)`, `makeDir(path)`, `getInfo(path)`.
+- `watchDir(path, onEvent, { intervalMs?, recursive? })` — watch for `create`/`modify`/`remove`; returns a watcher with `.stop()`. **Polling-based** (not inotify): smolvm has no guest→host filesystem event stream yet, so it diffs snapshots (default every 1s).
 
 ### Metrics — `sbx.getMetrics()`
 Point-in-time resource sample: `{ cpuMillis, memMb, diskMb, egressBytes }`.

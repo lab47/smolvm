@@ -44,9 +44,13 @@ export type {
   CommandResult,
   CommandOpts,
   BackgroundCommandHandle,
+  ProcessInfo,
   FileReadOpts,
   FileEntry,
   FileInfo,
+  FileEvent,
+  FileWatcher,
   SandboxInfo,
   SandboxMetrics,
+  ListOpts,
 } from "./types.js";

@@ -614,6 +614,16 @@ pub struct CreateMachineRequest {
     #[serde(default)]
     #[schema(example = 300)]
     pub timeout_secs: Option<u64>,
+    /// What the auto-idle window does on expiry: `pause` (default), `stop`, or
+    /// `kill`. Only meaningful with `timeoutSecs`.
+    #[serde(default)]
+    #[schema(example = "pause")]
+    pub on_idle: Option<String>,
+    /// Arbitrary key/value labels stored on the machine (e2b sandbox metadata),
+    /// for finding it later via a filtered list.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// Machine status information.
@@ -711,6 +721,10 @@ pub struct MachineInfo {
     pub disk_used_mb: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
+    /// User key/value labels attached at create (e2b sandbox metadata). Omitted
+    /// when empty.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// One egress denial: the machine's egress policy refused an outbound

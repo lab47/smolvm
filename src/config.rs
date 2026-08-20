@@ -638,6 +638,11 @@ pub struct VmRecord {
     /// (cold) or `"kill"` (delete). `None` = `"pause"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_action: Option<String>,
+
+    /// Arbitrary user key/value labels (e2b-style sandbox metadata), for finding
+    /// a machine later via a filtered list. Opaque to smolvm.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
@@ -742,6 +747,7 @@ impl VmRecord {
             idle_timeout_secs: None,
             idle_deadline: None,
             idle_action: None,
+            metadata: std::collections::BTreeMap::new(),
         }
     }
 
@@ -811,6 +817,7 @@ impl VmRecord {
             idle_timeout_secs: None,
             idle_deadline: None,
             idle_action: None,
+            metadata: std::collections::BTreeMap::new(),
         }
     }
 

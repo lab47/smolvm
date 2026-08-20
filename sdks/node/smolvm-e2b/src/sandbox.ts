@@ -4,6 +4,7 @@ import { Files } from "./files.js";
 import { Pty } from "./pty.js";
 import type {
   ConnectOpts,
+  ListOpts,
   MachineInfoJson,
   ResumeOpts,
   SandboxInfo,
@@ -18,7 +19,14 @@ function toInfo(m: MachineInfoJson): SandboxInfo {
     memoryMb: m.memoryMb,
     pid: m.pid,
     createdAt: m.createdAt,
+    metadata: m.metadata ?? {},
   };
+}
+
+function matchesMetadata(m: MachineInfoJson, filter?: Record<string, string>): boolean {
+  if (!filter) return true;
+  const md = m.metadata ?? {};
+  return Object.entries(filter).every(([k, v]) => md[k] === v);
 }
 
 const machinesBase = "/api/v1/machines";
@@ -88,6 +96,8 @@ export class Sandbox {
       // host 0 → the server auto-allocates a free host port; the preview proxy
       // resolves the guest→host mapping from the machine info.
       ports: opts.ports?.map((guest) => ({ host: 0, guest })),
+      onIdle: opts.onTimeout,
+      metadata: opts.metadata,
     };
     const created = await client.requestJson<MachineInfoJson>("POST", machinesBase, {
       json: body,
@@ -119,11 +129,13 @@ export class Sandbox {
     return sbx;
   }
 
-  /** List all sandboxes known to the control plane. */
-  static async list(opts: ConnectionOpts = {}): Promise<SandboxInfo[]> {
+  /** List sandboxes known to the control plane, optionally filtered by metadata. */
+  static async list(opts: ListOpts = {}): Promise<SandboxInfo[]> {
     const client = new Client(opts);
     const res = await client.requestJson<{ machines: MachineInfoJson[] }>("GET", machinesBase);
-    return (res.machines ?? []).map(toInfo);
+    return (res.machines ?? [])
+      .filter((m) => matchesMetadata(m, opts.metadata))
+      .map(toInfo);
   }
 
   /** Delete a sandbox by id without needing an instance. */

@@ -1573,6 +1573,9 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         rss_mb,
         disk_used_mb,
         created_at: 0,
+        // Registry-derived info doesn't carry the record's user metadata; the
+        // record-backed path (`record_to_info`) surfaces it.
+        metadata: Default::default(),
     }
 }
 

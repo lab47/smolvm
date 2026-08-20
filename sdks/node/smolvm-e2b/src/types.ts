@@ -10,11 +10,18 @@ export interface SandboxOpts extends ConnectionOpts {
   /** Explicit sandbox name/id. Auto-generated when omitted. */
   sandboxId?: string;
   /**
-   * Auto-idle timeout in milliseconds. The sandbox auto-pauses after this long
+   * Auto-idle timeout in milliseconds. The sandbox auto-idles after this long
    * of inactivity (refreshed by `commands`/`files` activity and `setTimeout`).
    * `0`/omitted = never auto-idle.
    */
   timeoutMs?: number;
+  /**
+   * What happens when the idle timeout elapses: `"pause"` (default, resumable
+   * suspend-to-disk), `"stop"` (cold stop, disk kept), or `"kill"` (delete).
+   */
+  onTimeout?: "pause" | "stop" | "kill";
+  /** Arbitrary key/value labels to find this sandbox later via `Sandbox.list`. */
+  metadata?: Record<string, string>;
   /** Environment variables for the sandbox workload. */
   envs?: Record<string, string>;
   /** vCPU count (default: server default). */
@@ -73,6 +80,13 @@ export interface BackgroundCommandHandle {
   pid?: number;
 }
 
+/** A process running inside the sandbox, from {@link Commands.list}. */
+export interface ProcessInfo {
+  pid: number;
+  /** Full command line (argv joined by spaces). */
+  cmd: string;
+}
+
 /** Options for {@link Commands.run}. */
 export interface CommandOpts {
   /** Working directory. */
@@ -106,6 +120,18 @@ export interface FileEntry {
   type: "file" | "dir";
 }
 
+/** A filesystem change reported by {@link Files.watchDir}. */
+export interface FileEvent {
+  type: "create" | "modify" | "remove";
+  name: string;
+  path: string;
+}
+
+/** Handle to a running {@link Files.watchDir}; call `stop()` to end it. */
+export interface FileWatcher {
+  stop(): void;
+}
+
 /** Metadata for a single path, from {@link Files.getInfo}. */
 export interface FileInfo {
   name: string;
@@ -128,6 +154,14 @@ export interface SandboxInfo {
   memoryMb: number;
   pid?: number;
   createdAt: number;
+  /** User labels attached at create. */
+  metadata: Record<string, string>;
+}
+
+/** Filters for {@link Sandbox.list}. */
+export interface ListOpts extends ConnectionOpts {
+  /** Only return sandboxes whose metadata contains all of these key/values. */
+  metadata?: Record<string, string>;
 }
 
 /** A point-in-time resource sample for a sandbox. */
@@ -154,4 +188,5 @@ export interface MachineInfoJson {
   rssMb?: number;
   diskUsedMb?: number;
   egressBytes?: number;
+  metadata?: Record<string, string>;
 }

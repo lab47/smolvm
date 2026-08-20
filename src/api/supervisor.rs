@@ -132,11 +132,37 @@ impl Supervisor {
         if crate::util::current_timestamp() < deadline {
             return;
         }
-        tracing::info!(machine = %name, "auto-idle window elapsed; pausing");
-        if let Err(e) =
-            crate::api::handlers::machines::pause_machine_inner(&self.state, name).await
-        {
-            tracing::warn!(machine = %name, error = ?e, "auto-idle pause failed");
+        // Honor the machine's on-idle action: pause (default, resumable), stop
+        // (cold), or kill (delete).
+        let action = record.idle_action.as_deref().unwrap_or("pause");
+        tracing::info!(machine = %name, action, "auto-idle window elapsed");
+        use crate::api::handlers::machines as m;
+        let result: std::result::Result<(), String> = match action {
+            "stop" => m::stop_machine(
+                axum::extract::State(self.state.clone()),
+                axum::extract::Path(name.to_string()),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+            "kill" => m::delete_machine(
+                axum::extract::State(self.state.clone()),
+                axum::extract::Path(name.to_string()),
+                axum::extract::Query(crate::api::types::DeleteQuery {
+                    force: true,
+                    cascade: false,
+                }),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+            _ => m::pause_machine_inner(&self.state, name)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}")),
+        };
+        if let Err(e) = result {
+            tracing::warn!(machine = %name, action, error = %e, "auto-idle action failed");
         }
     }
 

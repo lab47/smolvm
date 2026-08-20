@@ -1,6 +1,6 @@
 import type { Client } from "./client.js";
 import type { Commands } from "./commands.js";
-import type { FileEntry, FileInfo, FileReadOpts } from "./types.js";
+import type { FileEntry, FileEvent, FileInfo, FileReadOpts, FileWatcher } from "./types.js";
 
 /** Reads and writes files inside a sandbox (the e2b `sandbox.files` surface).
  *
@@ -78,6 +78,66 @@ export class Files {
   /** Create a directory (and any missing parents) inside the sandbox. */
   async makeDir(path: string): Promise<void> {
     await this.commands.run(["mkdir", "-p", path], { throwOnError: true });
+  }
+
+  /**
+   * Watch a directory inside the sandbox for changes, invoking `onEvent` on each
+   * create/modify/remove.
+   *
+   * NOTE: this is **polling-based** (default every 1s), not inotify — smolvm has
+   * no guest→host filesystem event stream yet, so it diffs directory snapshots
+   * over `commands`. Fine for build-on-change and similar; not sub-second. Call
+   * `.stop()` on the returned watcher to end it.
+   */
+  async watchDir(
+    path: string,
+    onEvent: (event: FileEvent) => void,
+    opts: { intervalMs?: number; recursive?: boolean } = {},
+  ): Promise<FileWatcher> {
+    const interval = opts.intervalMs ?? 1000;
+    const snapshot = async (): Promise<Map<string, string>> => {
+      const depth = opts.recursive === false ? "-maxdepth 1" : "";
+      const res = await this.commands.run(
+        ["sh", "-c", `find ${shq(path)} ${depth} -exec stat -c '%n|%Y|%s' {} + 2>/dev/null`],
+        { throwOnError: false },
+      );
+      const map = new Map<string, string>();
+      for (const line of res.stdout.split("\n")) {
+        const i = line.indexOf("|");
+        if (i > 0) map.set(line.slice(0, i), line.slice(i + 1)); // path -> "mtime|size"
+      }
+      return map;
+    };
+
+    let prev = await snapshot();
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const base = (p: string) => p.replace(/\/+$/, "").split("/").pop() ?? p;
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const cur = await snapshot();
+        for (const [p, sig] of cur) {
+          const old = prev.get(p);
+          if (old === undefined) onEvent({ type: "create", path: p, name: base(p) });
+          else if (old !== sig) onEvent({ type: "modify", path: p, name: base(p) });
+        }
+        for (const p of prev.keys()) {
+          if (!cur.has(p)) onEvent({ type: "remove", path: p, name: base(p) });
+        }
+        prev = cur;
+      } catch {
+        /* transient exec error; try again next tick */
+      }
+      if (!stopped) timer = setTimeout(tick, interval);
+    };
+    timer = setTimeout(tick, interval);
+    return {
+      stop() {
+        stopped = true;
+        clearTimeout(timer);
+      },
+    };
   }
 
   /** Stat a path inside the sandbox: size, type, octal mode, and mtime. */
