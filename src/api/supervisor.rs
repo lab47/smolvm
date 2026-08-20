@@ -99,6 +99,8 @@ impl Supervisor {
             if let Err(e) = self.check_machine(&name).await {
                 tracing::warn!(machine = %name, error = %e, "failed to check machine");
             }
+            // Auto-idle: pause a running machine whose idle window has elapsed.
+            self.enforce_idle_timeout(&name).await;
         }
 
         // Reconcile the running gauge with actual state (handles crashed VMs
@@ -109,6 +111,33 @@ impl Supervisor {
 
         // Also rotate logs for all machines
         self.rotate_logs_if_needed().await;
+    }
+
+    /// Auto-idle enforcement (e2b sandbox timeout): if a running machine has an
+    /// armed idle deadline that has passed, pause it (suspend-to-disk) so it can
+    /// be resumed later. Activity and `setTimeout` push the deadline forward, so
+    /// this only fires on a genuinely idle sandbox. No-op for machines without an
+    /// idle window, or not currently running.
+    async fn enforce_idle_timeout(&self, name: &str) {
+        let record = match self.state.db().get_vm(name) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        if record.state != RecordState::Running {
+            return;
+        }
+        let Some(deadline) = record.idle_deadline else {
+            return;
+        };
+        if crate::util::current_timestamp() < deadline {
+            return;
+        }
+        tracing::info!(machine = %name, "auto-idle window elapsed; pausing");
+        if let Err(e) =
+            crate::api::handlers::machines::pause_machine_inner(&self.state, name).await
+        {
+            tracing::warn!(machine = %name, error = ?e, "auto-idle pause failed");
+        }
     }
 
     /// Check a single machine and restart if needed.
@@ -126,6 +155,15 @@ impl Supervisor {
         // Machine is dead — try to retrieve its exit code via waitpid
         // and persist it so the restart policy can use it.
         if let Ok(Some(record)) = self.state.db().get_vm(name) {
+            // A paused (or mid-pause) machine is intentionally not running. Never
+            // reap or restart it — and never overwrite Paused/Pausing with Stopped.
+            // A paused machine is resumed explicitly; a `Pausing` one is a pause in
+            // flight whose process was just freed but whose record has not yet
+            // settled to Paused.
+            if matches!(record.state, RecordState::Paused | RecordState::Pausing) {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
             if let Some(pid) = record.pid {
                 let exit_code = crate::process::try_wait(pid);
                 self.state.set_last_exit_code(name, exit_code);

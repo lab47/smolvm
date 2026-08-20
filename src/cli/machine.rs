@@ -316,6 +316,12 @@ pub enum MachineCmd {
     /// Stop a running machine
     Stop(StopCmd),
 
+    /// Pause a running machine (suspend to disk), freeing its process
+    Pause(PauseCmd),
+
+    /// Resume a paused machine, restoring its running processes
+    Resume(ResumeCmd),
+
     /// Delete a machine configuration
     #[command(visible_alias = "rm")]
     Delete(DeleteCmd),
@@ -388,6 +394,8 @@ impl MachineCmd {
             MachineCmd::Fork(cmd) => cmd.run(),
             MachineCmd::ForkRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
+            MachineCmd::Pause(cmd) => cmd.run(),
+            MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
@@ -3794,6 +3802,40 @@ impl StopCmd {
             Some(name) => vm_common::stop_vm_named(name),
             None => vm_common::stop_vm_default(),
         }
+    }
+}
+
+/// Pause a running machine: checkpoint its full RAM + device state to disk
+/// (suspend-to-disk / hibernate) and free the VMM process. `resume` restores it.
+#[derive(Args, Debug)]
+pub struct PauseCmd {
+    /// Machine to pause (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl PauseCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::resolve_vm_name(self.name)?
+            .unwrap_or_else(|| "default".to_string());
+        vm_common::pause_vm_named(&name)
+    }
+}
+
+/// Resume a paused machine from its suspend-to-disk checkpoint, restoring the
+/// running processes it had at pause time (not a cold boot).
+#[derive(Args, Debug)]
+pub struct ResumeCmd {
+    /// Machine to resume (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl ResumeCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::resolve_vm_name(self.name)?
+            .unwrap_or_else(|| "default".to_string());
+        vm_common::resume_vm_named(&name)
     }
 }
 

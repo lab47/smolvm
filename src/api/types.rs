@@ -479,7 +479,18 @@ pub struct ApiErrorResponse {
 // Machine Types
 // ============================================================================
 
-/// Request to create a new machine.
+/// Request to set/extend a machine's auto-idle window (e2b `setTimeout`).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTimeoutRequest {
+    /// New auto-idle window in seconds from now. The machine auto-pauses after
+    /// this long unless refreshed again (via activity or another setTimeout).
+    /// `0` disables auto-idle.
+    #[schema(example = 300)]
+    pub timeout_secs: u64,
+}
+
+/// Request to create a machine.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateMachineRequest {
@@ -597,6 +608,12 @@ pub struct CreateMachineRequest {
     /// manifest's workdir when set.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Auto-idle window in seconds (e2b sandbox timeout). When set, the machine
+    /// auto-pauses this long after it starts unless refreshed by activity or
+    /// `POST /{id}/timeout`. Omit or `0` to never auto-idle.
+    #[serde(default)]
+    #[schema(example = 300)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Machine status information.

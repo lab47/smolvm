@@ -53,6 +53,9 @@ pub async fn exec_command(
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
 
+    // Activity refreshes the auto-idle deadline so a busy sandbox is not paused.
+    super::machines::touch_idle_deadline(&state, &id).await;
+
     let entry = state.get_machine(&id)?;
 
     // Ensure machine is running and persist state to DB
@@ -349,6 +352,9 @@ pub async fn run_command(
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
+
+    // Activity refreshes the auto-idle deadline so a busy sandbox is not paused.
+    super::machines::touch_idle_deadline(&state, &id).await;
 
     let entry = state.get_machine(&id)?;
 

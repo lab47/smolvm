@@ -321,6 +321,13 @@ pub struct LaunchFeatures {
     /// Boot this VM as a fork clone, restoring from the golden's snapshot at
     /// this directory (set on the clone; `None` for a normal cold boot).
     pub snapshot_dir: Option<std::path::PathBuf>,
+    /// Resume this machine from its own suspend-to-disk checkpoint at
+    /// `snapshot_dir` (a hibernate image), rather than forking a golden. Unlike a
+    /// fork clone this is the SAME machine returning: it keeps its identity and
+    /// data dir, so the clone-only behaviour (is_clone marking, golden-uid
+    /// sharing, CUDA fork wiring, Landlock skip) is suppressed. Requires
+    /// `snapshot_dir` to be set; ignored otherwise.
+    pub resume: bool,
     /// Override the parent-death watchdog. `None` = default (arm it iff a
     /// separate boot binary is used, i.e. an in-process SDK embedder whose VM
     /// must die with it). `Some(false)` forces it off — for a CLI that sets

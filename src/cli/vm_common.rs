@@ -731,6 +731,9 @@ pub struct ForkLaunch {
     pub forkable: bool,
     /// Boot as a fork clone, restoring from the golden's snapshot at this dir.
     pub snapshot_dir: Option<std::path::PathBuf>,
+    /// Resume this machine from its OWN suspend-to-disk checkpoint at
+    /// `snapshot_dir` (keep identity — not a fork clone). See `LaunchFeatures::resume`.
+    pub resume: bool,
     /// Clone boot only: share the golden's loaded CUDA weights instead of
     /// copying them (`machine fork --share-weights`).
     pub share_weights: bool,
@@ -750,6 +753,7 @@ pub fn forkable_launch() -> ForkLaunch {
     ForkLaunch {
         forkable: true,
         snapshot_dir: None,
+        resume: false,
         share_weights: false,
         preload_modules: false,
         pool_size: None,
@@ -1274,7 +1278,25 @@ fn start_vm_named_with_db(
                 format!("'{name}' is frozen because {reason}"),
             ));
         }
-        RecordState::Stopped | RecordState::Created | RecordState::Failed => {
+        RecordState::Pausing => {
+            // A pause is in flight (checkpoint running); the machine will settle to
+            // `paused` shortly. Refuse rather than race the checkpoint.
+            return Err(Error::agent(
+                "start",
+                format!("'{name}' is pausing; wait for it to finish, then `smolvm machine resume {name}`"),
+            ));
+        }
+        RecordState::Paused if !fork.resume => {
+            // A cold `start` would discard the suspend-to-disk checkpoint and
+            // lose the machine's running processes. Refuse and point at `resume`,
+            // which rehydrates them. (A resume sets `fork.resume` and falls
+            // through to the launch path below with the hibernate image.)
+            return Err(Error::agent(
+                "start",
+                format!("'{name}' is paused; run `smolvm machine resume {name}` to restore it"),
+            ));
+        }
+        RecordState::Paused | RecordState::Stopped | RecordState::Created | RecordState::Failed => {
             // Normal start path. Kill any orphaned _boot-vm process left by
             // a previous failed start — if one is holding ports/sockets, this
             // fresh start would hit the same error without this cleanup.
@@ -1390,6 +1412,7 @@ fn start_vm_named_with_db(
     // the boot subprocess's env by the manager, not via process-global env vars.
     features.forkable = fork.forkable;
     features.snapshot_dir = fork.snapshot_dir;
+    features.resume = fork.resume;
     features.cuda_share_weights = fork.share_weights;
     features.cuda_preload_modules = fork.preload_modules;
     features.cuda_fork_pool_size = record.cuda_fork_pool_size;
@@ -1578,12 +1601,22 @@ fn start_vm_named_with_db(
     // Persist running state. The 15s busy_timeout handles SQLite contention
     // from concurrent starts — no application-level retry needed.
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+    let clear_hibernate = fork.resume;
     if let Err(e) = db.update_vm(name, |r| {
         r.state = RecordState::Running;
         r.pid = pid;
         r.pid_start_time = pid_start_time;
+        // A resume has rehydrated (and diverged from) the checkpoint — drop the
+        // stale hibernate pointer so a later `start` cold-boots normally.
+        if clear_hibernate {
+            r.hibernate_dir = None;
+        }
     }) {
         tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+    }
+    // Best-effort removal of the now-stale on-disk checkpoint after a resume.
+    if clear_hibernate {
+        let _ = std::fs::remove_dir_all(smolvm::agent::vm_data_dir(name).join("hibernate"));
     }
 
     // Keep VM running (persistent)
@@ -1816,6 +1849,102 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
 // ============================================================================
 
 /// Stop a named machine that has a config record (or fall back to
+/// Pause (suspend-to-disk) a running machine: checkpoint its full RAM + device
+/// state to `<data_dir>/hibernate` via the libkrun control socket, then free the
+/// VMM process. `resume_vm_named` later rehydrates the running processes.
+pub fn pause_vm_named(name: &str) -> smolvm::Result<()> {
+    use smolvm::Error;
+    let db = SmolvmDb::open()?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+
+    // A frozen fork base must outlive its clones; never pause it.
+    let clones = db.dependent_clones(name).unwrap_or_default();
+    if !clones.is_empty() {
+        return Err(Error::agent(
+            "pause",
+            format!(
+                "'{name}' is the fork base of live clone(s) ({}); pause or delete them first",
+                clones.join(", ")
+            ),
+        ));
+    }
+
+    match smolvm::agent::state_probe::resolve_state(name, &record) {
+        RecordState::Running => {}
+        other => {
+            return Err(Error::agent(
+                "pause",
+                format!("machine '{name}' must be running to pause (is {other})"),
+            ));
+        }
+    }
+
+    let hibernate_dir = vm_data_dir(name).join("hibernate");
+    let ctl = smolvm::agent::fork::control_socket_path(name);
+    // Clear any stale checkpoint so a fresh, complete image never sits beside a
+    // torn one.
+    let _ = std::fs::remove_dir_all(&hibernate_dir);
+    let reply = smolvm::agent::fork::control_socket_cmd(
+        &ctl,
+        &format!("HIBERNATE {}", hibernate_dir.display()),
+    )?;
+    if !reply.starts_with("OK") {
+        return Err(Error::agent("pause", format!("hibernate refused: {reply}")));
+    }
+
+    // The VM is checkpointed and paused with its state fully on disk — free the
+    // process with an immediate SIGKILL (no graceful vsock shutdown, which would
+    // run guest teardown and defeat the point of preserving the live state).
+    if let Some(pid) = record.pid {
+        let _ = smolvm::process::stop_vm_process(
+            pid,
+            std::time::Duration::ZERO,
+            smolvm::process::VM_SIGKILL_TIMEOUT,
+        );
+    }
+
+    let hibernate_dir_str = hibernate_dir.to_string_lossy().into_owned();
+    db.update_vm(name, |r| {
+        r.state = RecordState::Paused;
+        r.pid = None;
+        r.pid_start_time = None;
+        r.hibernate_dir = Some(hibernate_dir_str);
+    })?;
+    println!("Paused machine: {name}");
+    Ok(())
+}
+
+/// Resume a paused machine from its suspend-to-disk checkpoint (keeps identity —
+/// not a fork clone). The workload is NOT relaunched: it is already alive inside
+/// the restored memory.
+pub fn resume_vm_named(name: &str) -> smolvm::Result<()> {
+    use smolvm::Error;
+    let db = SmolvmDb::open()?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    if record.state != RecordState::Paused {
+        return Err(Error::agent(
+            "resume",
+            format!("machine '{name}' is not paused (is {})", record.state),
+        ));
+    }
+    let dir = record.hibernate_dir.clone().ok_or_else(|| {
+        Error::agent(
+            "resume",
+            format!("paused machine '{name}' has no hibernate checkpoint recorded"),
+        )
+    })?;
+    let fork = ForkLaunch {
+        snapshot_dir: Some(std::path::PathBuf::from(dir)),
+        resume: true,
+        ..Default::default()
+    };
+    // from_snapshot=true so the launch restores instead of cold-booting and does
+    // not relaunch the workload container.
+    start_vm_named_with_db(&db, name, None, None, true, fork)?;
+    println!("Resumed machine: {name}");
+    Ok(())
+}
+
 /// agent-only stop if the name is not in config).
 pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     let mut config = SmolvmConfig::load()?;

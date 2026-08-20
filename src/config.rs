@@ -63,6 +63,20 @@ pub enum RecordState {
     /// must outlive its clones. Resolved on the fly when a record has
     /// dependent clones; not persisted.
     Frozen,
+    /// Machine was paused (suspend-to-disk / hibernate): its full RAM + device
+    /// state was checkpointed to `hibernate_dir` and the VMM process was then
+    /// freed. Like `Stopped`, no VMM process is alive and the disks are intact —
+    /// but a resume rehydrates the running processes from the checkpoint instead
+    /// of cold-booting, so it is reported distinctly and is never reaped or
+    /// cold-restarted out from under its snapshot. Persisted.
+    Paused,
+    /// Transient: a `pause` is in progress — the VMM is checkpointing its guest
+    /// RAM to disk (vCPUs frozen), which can take seconds for a large VM. Reported
+    /// so a concurrent status read sees a clear "in transition" state instead of
+    /// `Unreachable` (which otherwise fits a frozen-agent VM and reads as a crash).
+    /// Set at the start of `pause` and replaced by `Paused` on completion; never
+    /// reaped. Persisted only for the brief pause window.
+    Pausing,
 }
 
 impl std::fmt::Display for RecordState {
@@ -74,6 +88,8 @@ impl std::fmt::Display for RecordState {
             RecordState::Failed => write!(f, "failed"),
             RecordState::Unreachable => write!(f, "unreachable"),
             RecordState::Frozen => write!(f, "frozen"),
+            RecordState::Paused => write!(f, "paused"),
+            RecordState::Pausing => write!(f, "pausing"),
         }
     }
 }
@@ -599,6 +615,29 @@ pub struct VmRecord {
     /// CLI/SDK machine.
     #[serde(default)]
     pub runtime_managed: bool,
+
+    /// Directory holding this machine's suspend-to-disk checkpoint
+    /// (`memory.img` + `checkpoint.bin` + `hibernate.bin`), written by `pause`.
+    /// Set while the machine is `Paused`; a `resume` boots from it via
+    /// `SMOLVM_SNAPSHOT_DIR` and clears it once the machine is running again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hibernate_dir: Option<String>,
+
+    /// Auto-idle window in seconds (e2b-style sandbox timeout). When set, the
+    /// supervisor auto-pauses the running machine once `idle_deadline` passes.
+    /// `setTimeout` and activity refresh the deadline; `None` = never auto-idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+
+    /// Absolute time (Unix seconds) at which the auto-idle action fires unless
+    /// refreshed. Maintained from `idle_timeout_secs` on start/activity/setTimeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_deadline: Option<u64>,
+
+    /// What auto-idle does on expiry: `"pause"` (default, resumable) or `"stop"`
+    /// (cold) or `"kill"` (delete). `None` = `"pause"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_action: Option<String>,
 }
 
 /// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
@@ -699,6 +738,10 @@ impl VmRecord {
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
+            hibernate_dir: None,
+            idle_timeout_secs: None,
+            idle_deadline: None,
+            idle_action: None,
         }
     }
 
@@ -764,6 +807,10 @@ impl VmRecord {
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
+            hibernate_dir: None,
+            idle_timeout_secs: None,
+            idle_deadline: None,
+            idle_action: None,
         }
     }
 

@@ -1852,7 +1852,11 @@ impl AgentManager {
         {
             let shared_setting = std::env::var("SMOLVM_CUDA_SHARED").ok();
             let external_daemon = std::env::var_os("SMOLVM_CUDA_DAEMON").is_some();
-            let fork_context = features.forkable || features.snapshot_dir.is_some();
+            // A resume boots from a snapshot dir but is the SAME machine
+            // returning, not a fork clone — it must not pull in golden/clone CUDA
+            // wiring.
+            let fork_context =
+                features.forkable || (features.snapshot_dir.is_some() && !features.resume);
             if needs_managed_cuda_daemon(
                 features.cuda || resources.cuda,
                 fork_context,
@@ -1919,7 +1923,12 @@ impl AgentManager {
         // `std::env::set_var`. A process-global env var is a data race in the
         // multithreaded `serve` process, where concurrent forks would clobber
         // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
-        let fork_clone = features.snapshot_dir.is_some();
+        // A fork clone boots from a golden's snapshot; a resume boots from this
+        // same machine's own hibernate image. Both set `snapshot_dir`, but only a
+        // fork clone gets clone semantics (is_clone marking, golden-uid sharing,
+        // CUDA fork wiring). `SMOLVM_SNAPSHOT_DIR` is still exported for both so
+        // libkrun restores instead of cold-booting.
+        let fork_clone = features.snapshot_dir.is_some() && !features.resume;
         let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
         let fork_env: Vec<(&str, String)> = {
             let mut v = Vec::new();
@@ -1941,6 +1950,12 @@ impl AgentManager {
             }
             if let Some(ref snap) = features.snapshot_dir {
                 v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));
+                // Distinguish a resume (same machine, keep identity, no Landlock
+                // skip / clone rejuvenation) from a fork clone. libkrun detects
+                // the hibernate image itself; this only steers smolvm's boot path.
+                if features.resume {
+                    v.push(("SMOLVM_RESUME", "1".to_string()));
+                }
             }
             if features.cuda_share_weights {
                 // Read by the clone VMM's CUDA proxy: sets the share-weights bit
@@ -1964,15 +1979,20 @@ impl AgentManager {
             // one-vCPU workaround and cover restored CUDA clones, where
             // immediate entry can leave the VMM alive while the guest agent
             // never responds. This sleeps once for 5 ms before the first
-            // KVM_RUN and has no steady-state cost.
+            // KVM_RUN and has no steady-state cost. A resume is also a restore
+            // (boot-from-snapshot), so it hits the same first-entry race — give
+            // it the delay too.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            if should_delay_first_kvm_run(resources_for_config.cpus, cuda_clone) {
+            if should_delay_first_kvm_run(resources_for_config.cpus, cuda_clone) || features.resume {
                 v.push(("KRUN_FIRST_RUN_DELAY", "1".to_string()));
             }
             // Bounded retries remain separate: they add no delay unless
-            // KVM_RUN actually returns ENOMEM.
+            // KVM_RUN actually returns ENOMEM. A resume restores a full guest-RAM
+            // image, so it allocates like a fork clone — cover it too.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            if should_retry_kvm_enomem(resources_for_config.cpus, features.forkable, fork_clone) {
+            if should_retry_kvm_enomem(resources_for_config.cpus, features.forkable, fork_clone)
+                || features.resume
+            {
                 v.push(("KRUN_ENOMEM_RETRY", "1".to_string()));
             }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
@@ -1999,7 +2019,7 @@ impl AgentManager {
             // process, its own context) would fork into a broken clone. No-op for
             // non-CUDA machines — the daemon is only ever spawned from the CUDA
             // host path, which runs only when the machine has `cuda`.
-            if !shared_set && (features.forkable || features.snapshot_dir.is_some()) {
+            if !shared_set && (features.forkable || fork_clone) {
                 v.push(("SMOLVM_CUDA_SHARED", "1".to_string()));
             }
             // Auto-enable Path 3 isolating forks for a fork base / clone, same
@@ -2011,9 +2031,7 @@ impl AgentManager {
             // daemon; a daemon already running in another mode keeps that mode
             // until restarted.
             for flag in ["SMOLVM_CUDA_FORK_WORKERS", "SMOLVM_CUDA_FORK_ISOLATE"] {
-                if std::env::var_os(flag).is_none()
-                    && (features.forkable || features.snapshot_dir.is_some())
-                {
+                if std::env::var_os(flag).is_none() && (features.forkable || fork_clone) {
                     v.push((flag, "1".to_string()));
                 }
             }
@@ -2021,7 +2039,13 @@ impl AgentManager {
         };
         {
             let mut inner = self.inner.lock();
-            inner.is_clone = fork_clone;
+            // `is_clone` selects the readiness-detection path: any boot-from-
+            // snapshot VM (a fork clone OR a resume) resumes PAST boot and never
+            // (re)writes the `.smolvm-ready` marker, so `wait_for_ready` must
+            // detect readiness by pinging the restored agent rather than waiting
+            // for a marker that will never appear. This is distinct from
+            // `fork_clone` (the CUDA/golden-uid wiring), which a resume must skip.
+            inner.is_clone = features.snapshot_dir.is_some();
             inner.is_cuda_clone = cuda_clone;
         }
 
@@ -2056,7 +2080,15 @@ impl AgentManager {
             if let Some(result) = crate::process::vm_drop_ids(
                 &registry,
                 d,
-                features.snapshot_dir.as_deref(),
+                // A fork clone maps the golden's memfd, so it shares the golden's
+                // uid resolved from the snapshot path. A resume reads its OWN
+                // hibernate image from its OWN (chowned) data dir, so it takes a
+                // fresh per-VM uid like any normal boot — pass no golden path.
+                if features.resume {
+                    None
+                } else {
+                    features.snapshot_dir.as_deref()
+                },
                 features.uid_share_dir.as_deref(),
             ) {
                 // The drop is active — allocation MUST succeed or we refuse to boot

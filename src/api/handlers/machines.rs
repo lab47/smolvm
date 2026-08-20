@@ -832,6 +832,20 @@ pub async fn create_machine(
         return Err(e);
     }
 
+    // Persist the auto-idle window (e2b sandbox timeout). The deadline itself is
+    // armed when the machine reaches Running (create may or may not auto-start).
+    if let Some(secs) = req.timeout_secs.filter(|s| *s > 0) {
+        let now = crate::util::current_timestamp();
+        let _ = state
+            .update_vm(&name, move |r| {
+                r.idle_timeout_secs = Some(secs);
+                if r.state == RecordState::Running {
+                    r.idle_deadline = Some(now + secs);
+                }
+            })
+            .await;
+    }
+
     // Fetch the persisted record for the response (off the reactor).
     let record = state
         .lookup_vm(&name)
@@ -1301,6 +1315,10 @@ pub async fn start_machine(
             // exhausted max_retries can be restarted and supervised again.
             r.restart.user_stopped = false;
             r.restart.restart_count = 0;
+            // Arm the auto-idle deadline now that it's running.
+            if let Some(window) = r.idle_timeout_secs {
+                r.idle_deadline = Some(crate::util::current_timestamp() + window);
+            }
         })
         .await?
         .ok_or_else(|| {
@@ -1318,6 +1336,278 @@ pub async fn start_machine(
     info.state = "running".to_string();
     info.pid = pid;
     Ok(Json(info))
+}
+
+/// `POST /{id}/pause` — suspend a running machine to disk (e2b-style pause).
+///
+/// Sends `HIBERNATE <dir>` over the machine's libkrun control socket: the VMM
+/// pauses the vCPUs, checkpoints the full guest RAM + device/vCPU state into the
+/// machine's own data dir, and stays paused. We then free the (paused) VMM
+/// process. A later [`resume_machine`] rehydrates the running processes from the
+/// checkpoint instead of cold-booting. The disks are untouched; only the live
+/// process is released.
+pub async fn pause_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let record = pause_machine_inner(&state, &name).await?;
+    let mut info = record_to_info(&name, &record);
+    info.state = "paused".to_string();
+    info.pid = None;
+    Ok(Json(info))
+}
+
+/// Shared pause implementation used by the HTTP handler and the auto-idle
+/// supervisor. Acquires the machine's lifecycle lock, checkpoints it to disk via
+/// the control socket, frees the VMM process, and persists `Paused`.
+pub(crate) async fn pause_machine_inner(
+    state: &Arc<ApiState>,
+    name: &str,
+) -> Result<VmRecord, ApiError> {
+    let name = name.to_string();
+    // Outermost lifecycle lock, mirroring start/stop: a concurrent stop/start/
+    // fork must not race the checkpoint-then-free.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    // A frozen fork base must outlive its clones (they CoW-map its live RAM), so
+    // it can never be paused — mirror the stop/delete guard.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' is the fork base of {} live clone(s) ({}); pause or delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
+
+    // Resolve real liveness (PID + vsock ping) so a zombie isn't "paused".
+    let name_probe = name.clone();
+    let record_probe = record.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::agent::state_probe::resolve_state(&name_probe, &record_probe)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    if resolved != RecordState::Running {
+        return Err(ApiError::Conflict(format!(
+            "machine '{}' must be running to pause (is {})",
+            name, resolved
+        )));
+    }
+
+    let hibernate_dir = crate::agent::vm_data_dir(&name).join("hibernate");
+    let ctl = crate::agent::fork::control_socket_path(&name);
+    let pid = record.pid;
+
+    // Mark the machine `Pausing` for the duration of the checkpoint (which freezes
+    // the vCPUs, so a health ping would otherwise resolve to `Unreachable` and look
+    // like a crash). A concurrent status read now sees a clear transitional state.
+    let _ = state
+        .update_vm(&name, |r| r.state = RecordState::Pausing)
+        .await;
+
+    let dir_for_cmd = hibernate_dir.clone();
+    let checkpoint = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // Clear any stale checkpoint from a previous pause so a fresh, complete
+        // image never sits beside a torn one.
+        let _ = std::fs::remove_dir_all(&dir_for_cmd);
+        let reply = crate::agent::fork::control_socket_cmd(
+            &ctl,
+            &format!("HIBERNATE {}", dir_for_cmd.display()),
+        )
+        .map_err(|e| format!("control socket: {e}"))?;
+        if !reply.starts_with("OK") {
+            return Err(format!("hibernate refused: {reply}"));
+        }
+        // The VM is checkpointed and paused with its state fully on disk — free
+        // the process with an immediate SIGKILL. We deliberately skip the graceful
+        // vsock shutdown (it would run guest teardown and defeat the point of
+        // preserving the live state).
+        if let Some(pid) = pid {
+            let _ = stop_vm_process(pid, std::time::Duration::ZERO, VM_SIGKILL_TIMEOUT);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    if let Err(e) = checkpoint {
+        // The checkpoint failed before we killed anything — the VM is still the
+        // live, running machine. Restore `Running` so it isn't stranded `Pausing`.
+        let _ = state
+            .update_vm(&name, |r| r.state = RecordState::Running)
+            .await;
+        return Err(ApiError::internal(e));
+    }
+
+    // Release the per-VM registry lock (flock) so a later resume can re-acquire
+    // it. The entry stays registered (so GET still reflects the machine); the
+    // supervisor's reaper skips Paused records, so it won't reset the state.
+    if let Ok(entry) = state.get_machine(&name) {
+        entry.lock().manager.mark_stopped();
+    }
+
+    let hibernate_dir_str = hibernate_dir.to_string_lossy().into_owned();
+    let record = state
+        .update_vm(&name, move |r| {
+            r.state = RecordState::Paused;
+            r.pid = None;
+            r.pid_start_time = None;
+            r.hibernate_dir = Some(hibernate_dir_str);
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("machine '{}' disappeared from database during pause", name))
+        })?;
+
+    Ok(record)
+}
+
+/// `POST /{id}/resume` — rehydrate a paused machine from its suspend-to-disk
+/// checkpoint (e2b-style resume). Boots the SAME machine from its hibernate image
+/// via `SMOLVM_SNAPSHOT_DIR` (keeping its identity — not a fork clone), so its
+/// running processes continue from the pause point. The workload container is NOT
+/// relaunched: it is already alive inside the restored memory.
+pub async fn resume_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    if record.state != RecordState::Paused {
+        return Err(ApiError::Conflict(format!(
+            "machine '{}' is not paused (is {})",
+            name, record.state
+        )));
+    }
+    let hibernate_dir = record.hibernate_dir.clone().ok_or_else(|| {
+        ApiError::internal(format!("paused machine '{}' has no hibernate dir recorded", name))
+    })?;
+
+    let mounts = record.host_mounts();
+    let ports = record.port_mappings();
+    let resources = record.vm_resources();
+    let storage_gb = record.storage_gb;
+    let overlay_gb = record.overlay_gb;
+    let source_smolmachine = record.source_smolmachine.clone();
+    let dns_filter_hosts = record.dns_filter_hosts.clone();
+
+    let name_clone = name.clone();
+    let snapshot_dir = std::path::PathBuf::from(&hibernate_dir);
+    let (manager, pid) = tokio::task::spawn_blocking(move || {
+        let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
+            .map_err(|e| format!("failed to create agent manager: {}", e))?;
+        let mut features = crate::api::state::build_launch_features(
+            Some(&name_clone),
+            source_smolmachine.as_deref(),
+            dns_filter_hosts,
+        )
+        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        // Boot from this machine's own hibernate image, as a resume (keep
+        // identity), not a fork clone.
+        features.snapshot_dir = Some(snapshot_dir);
+        features.resume = true;
+        let _ = manager
+            .ensure_running_via_subprocess(mounts, ports, resources, features)
+            .map_err(|e| format!("failed to resume machine: {}", e))?;
+        let pid = manager.child_pid();
+        Ok::<_, String>((manager, pid))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(classify_launch_error)?;
+
+    state.insert_machine(&name, machine_entry_from_record(&record, manager));
+
+    let pid_start_time = pid.and_then(process_start_time);
+    // The resumed VM has diverged from the checkpoint, so the image is now stale —
+    // drop it and clear the record's pointer once we're running again.
+    let stale_dir = hibernate_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(&stale_dir);
+    })
+    .await
+    .ok();
+
+    let record = state
+        .update_vm(&name, move |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
+            r.hibernate_dir = None;
+            r.restart.user_stopped = false;
+            // Re-arm the auto-idle deadline on resume.
+            if let Some(window) = r.idle_timeout_secs {
+                r.idle_deadline = Some(crate::util::current_timestamp() + window);
+            }
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("machine '{}' disappeared from database during resume", name))
+        })?;
+
+    let mut info = record_to_info(&name, &record);
+    info.state = "running".to_string();
+    info.pid = pid;
+    Ok(Json(info))
+}
+
+/// `POST /{id}/timeout` — set or extend the machine's auto-idle window (e2b
+/// `setTimeout`). The supervisor auto-pauses the machine `timeout_secs` from now
+/// unless refreshed again. `timeout_secs` of 0 disables auto-idle.
+pub async fn set_timeout_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<crate::api::types::SetTimeoutRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let secs = req.timeout_secs;
+    let (timeout, deadline) = if secs == 0 {
+        (None, None)
+    } else {
+        (Some(secs), Some(crate::util::current_timestamp() + secs))
+    };
+    let record = state
+        .update_vm(&name, move |r| {
+            r.idle_timeout_secs = timeout;
+            r.idle_deadline = deadline;
+        })
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Refresh a machine's auto-idle deadline to `now + idle_timeout_secs`, if it has
+/// an idle window configured. Called on activity (exec/files) so a busy sandbox
+/// is not paused out from under its caller. Best-effort and cheap; a machine
+/// without `idle_timeout_secs` is left untouched.
+pub(crate) async fn touch_idle_deadline(state: &Arc<ApiState>, name: &str) {
+    let now = crate::util::current_timestamp();
+    let _ = state
+        .update_vm(name, move |r| {
+            if let Some(window) = r.idle_timeout_secs {
+                r.idle_deadline = Some(now + window);
+            }
+        })
+        .await;
 }
 
 /// Classify a fork-preparation failure into the right HTTP status. The golden

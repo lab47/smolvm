@@ -250,8 +250,12 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // Landlock-confined clone can never open the memfd (EACCES → can't boot).
     // Clones therefore skip Landlock; they stay confined by seccomp, the per-VM
     // uid drop, and the cgroup. Goldens and normal VMs are unaffected.
+    // A resume also sets SMOLVM_SNAPSHOT_DIR (to restore from its hibernate image)
+    // but is NOT a fork clone: it maps its own image from its own data dir, so it
+    // keeps Landlock (no golden memfd to reach) and takes no clone-only paths.
     #[cfg(target_os = "linux")]
-    let is_fork_clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some();
+    let is_fork_clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some()
+        && std::env::var_os("SMOLVM_RESUME").is_none();
 
     // Confine the VMM's filesystem view via Landlock — BEFORE seccomp (whose
     // allowlist omits the landlock_* syscalls) and before libkrun loads. Granted:
@@ -567,7 +571,8 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .join("cuda.sock");
         match smolvm::cuda_host::start_with_clone_mode(
             &path,
-            std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
+            std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some()
+                && std::env::var_os("SMOLVM_RESUME").is_none(),
         ) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "CUDA host server started");
