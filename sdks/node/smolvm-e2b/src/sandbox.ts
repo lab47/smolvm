@@ -1,6 +1,7 @@
 import { Client, type ConnectionOpts } from "./client.js";
 import { Commands } from "./commands.js";
 import { Files } from "./files.js";
+import { Pty } from "./pty.js";
 import type {
   ConnectOpts,
   MachineInfoJson,
@@ -43,6 +44,8 @@ export class Sandbox {
   readonly commands: Commands;
   /** Read/write files inside the sandbox. */
   readonly files: Files;
+  /** Open interactive terminal (PTY) sessions inside the sandbox. */
+  readonly pty: Pty;
 
   private client: Client;
   private previewDomain: string;
@@ -54,6 +57,7 @@ export class Sandbox {
       previewDomain ?? process.env.SMOLVM_PREVIEW_DOMAIN ?? "localhost";
     this.commands = new Commands(client, sandboxId);
     this.files = new Files(client, this.commands, sandboxId);
+    this.pty = new Pty(client, sandboxId);
   }
 
   /**
@@ -166,6 +170,24 @@ export class Sandbox {
   /** Whether the sandbox is currently running. */
   async isRunning(): Promise<boolean> {
     return (await this.getInfo()).state === "running";
+  }
+
+  /**
+   * Current resource usage of the sandbox (a point-in-time sample). Empty fields
+   * mean the value isn't available (e.g. a paused/stopped sandbox has no live
+   * process to sample).
+   */
+  async getMetrics(): Promise<import("./types.js").SandboxMetrics> {
+    const m = await this.client.requestJson<MachineInfoJson>(
+      "GET",
+      `${machinesBase}/${id(this.sandboxId)}`,
+    );
+    return {
+      cpuMillis: m.cpuMillis,
+      memMb: m.rssMb,
+      diskMb: m.diskUsedMb,
+      egressBytes: m.egressBytes,
+    };
   }
 
   /** Permanently delete the sandbox and its data. */

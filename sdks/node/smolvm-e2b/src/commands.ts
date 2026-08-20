@@ -41,11 +41,54 @@ export class Commands {
       stdin: opts.stdin,
       background: opts.background ?? false,
     };
-    const res = await this.client.requestJson<ExecResponseJson>(
-      "POST",
-      `/api/v1/machines/${encodeURIComponent(this.sandboxId)}/exec`,
-      { json: body, timeoutMs: opts.timeoutMs ? opts.timeoutMs + 5_000 : undefined },
-    );
+    const base = `/api/v1/machines/${encodeURIComponent(this.sandboxId)}`;
+    const timeoutMs = opts.timeoutMs ? opts.timeoutMs + 5_000 : undefined;
+
+    // Stream when the caller wants live output. Accumulate the full stdout/stderr
+    // too so a streaming call still returns a CommandResult, like e2b.
+    if (!opts.background && (opts.onStdout || opts.onStderr)) {
+      let stdout = "";
+      let stderr = "";
+      let exitCode = 0;
+      let errorMsg: string | undefined;
+      await this.client.stream("POST", `${base}/exec/stream`, { json: body, timeoutMs }, (event, data) => {
+        switch (event) {
+          case "stdout":
+            stdout += data;
+            opts.onStdout?.(data);
+            break;
+          case "stderr":
+            stderr += data;
+            opts.onStderr?.(data);
+            break;
+          case "exit":
+            try {
+              exitCode = JSON.parse(data).exitCode ?? 0;
+            } catch {
+              /* ignore malformed */
+            }
+            break;
+          case "error":
+            try {
+              errorMsg = JSON.parse(data).message;
+            } catch {
+              errorMsg = data;
+            }
+            break;
+        }
+      });
+      if (errorMsg) throw new CommandExitError(exitCode || 1, stdout, errorMsg);
+      const result: CommandResult = { exitCode, stdout, stderr };
+      if (result.exitCode !== 0 && (opts.throwOnError ?? true)) {
+        throw new CommandExitError(result.exitCode, result.stdout, result.stderr);
+      }
+      return result;
+    }
+
+    const res = await this.client.requestJson<ExecResponseJson>("POST", `${base}/exec`, {
+      json: body,
+      timeoutMs,
+    });
 
     if (opts.background) {
       // The control plane returns the detached PID either as a `pid` field or

@@ -26,6 +26,8 @@
 export { Sandbox } from "./sandbox.js";
 export { Commands } from "./commands.js";
 export { Files } from "./files.js";
+export { Pty } from "./pty.js";
+export type { PtyOpts, PtyHandle } from "./pty.js";
 export { Client } from "./client.js";
 export type { ConnectionOpts, RequestOpts } from "./client.js";
 export {
@@ -44,5 +46,7 @@ export type {
   BackgroundCommandHandle,
   FileReadOpts,
   FileEntry,
+  FileInfo,
   SandboxInfo,
+  SandboxMetrics,
 } from "./types.js";

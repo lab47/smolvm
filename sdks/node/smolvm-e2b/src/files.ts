@@ -1,6 +1,6 @@
 import type { Client } from "./client.js";
 import type { Commands } from "./commands.js";
-import type { FileEntry, FileReadOpts } from "./types.js";
+import type { FileEntry, FileInfo, FileReadOpts } from "./types.js";
 
 /** Reads and writes files inside a sandbox (the e2b `sandbox.files` surface).
  *
@@ -73,6 +73,30 @@ export class Files {
       throwOnError: false,
     });
     return res.exitCode === 0;
+  }
+
+  /** Create a directory (and any missing parents) inside the sandbox. */
+  async makeDir(path: string): Promise<void> {
+    await this.commands.run(["mkdir", "-p", path], { throwOnError: true });
+  }
+
+  /** Stat a path inside the sandbox: size, type, octal mode, and mtime. */
+  async getInfo(path: string): Promise<FileInfo> {
+    const res = await this.commands.run(
+      ["sh", "-c", `stat -c '%s|%F|%a|%Y' ${shq(path)}`],
+      { throwOnError: true },
+    );
+    const [size, kind, mode, mtime] = res.stdout.trim().split("|");
+    const type: "file" | "dir" = kind.includes("directory") ? "dir" : "file";
+    const name = path.replace(/\/+$/, "").split("/").pop() ?? path;
+    return {
+      name,
+      path,
+      type,
+      size: Number(size),
+      mode,
+      modifiedAt: new Date(Number(mtime) * 1000),
+    };
   }
 }
 

@@ -73,13 +73,36 @@ Every entry point accepts connection options (or reads `SMOLVM_API_URL` / `SMOLV
 ### Commands — `sbx.commands`
 - `run(cmd, opts?)` — run a command and await the result (`{ exitCode, stdout, stderr }`).
   - `cmd` is a shell string (run via `sh -c`) or an argv array (run directly).
-  - `opts`: `cwd`, `envs`, `timeoutMs`, `stdin`, `background`, `throwOnError` (default `true`).
+  - `opts`: `cwd`, `envs`, `timeoutMs`, `stdin`, `background`, `throwOnError` (default `true`), `onStdout`, `onStderr`.
+  - Pass `onStdout`/`onStderr` to **stream** output live as it arrives; the call still resolves with the full `{ exitCode, stdout, stderr }`.
   - `{ background: true }` returns `{ pid }` immediately for long-lived daemons.
+
+```ts
+await sbx.commands.run("npm run build", {
+  onStdout: (chunk) => process.stdout.write(chunk),
+  onStderr: (chunk) => process.stderr.write(chunk),
+});
+```
+
+### Terminal — `sbx.pty`
+- `create({ cmd, cols, rows, onData })` — start an interactive PTY; returns a handle.
+  - `handle.sendStdin(data)`, `handle.resize(cols, rows)`, `handle.kill()`, and `await handle.exited` (exit code).
+
+```ts
+const pty = await sbx.pty.create({ cmd: "/bin/bash", onData: (d) => process.stdout.write(d) });
+pty.sendStdin("ls -la\n");
+// ...later
+pty.sendStdin("exit\n");
+await pty.exited;
+```
 
 ### Files — `sbx.files`
 - `write(path, data)` — `data` is a string or `Uint8Array`.
 - `read(path, { format })` — `"text"` (default) → `string`, `"bytes"` → `Buffer`.
-- `list(dir)`, `remove(path)`, `rename(from, to)`, `exists(path)`.
+- `list(dir)`, `remove(path)`, `rename(from, to)`, `exists(path)`, `makeDir(path)`, `getInfo(path)`.
+
+### Metrics — `sbx.getMetrics()`
+Point-in-time resource sample: `{ cpuMillis, memMb, diskMb, egressBytes }`.
 
 ## Auto-idle & warm resume
 

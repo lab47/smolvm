@@ -87,6 +87,10 @@ export interface CommandOpts {
   background?: boolean;
   /** Throw {@link CommandExitError} on non-zero exit (default: true). */
   throwOnError?: boolean;
+  /** Called with each chunk of stdout as it streams (switches to streaming). */
+  onStdout?: (data: string) => void;
+  /** Called with each chunk of stderr as it streams (switches to streaming). */
+  onStderr?: (data: string) => void;
 }
 
 /** Options for {@link Files.read}. */
@@ -102,6 +106,19 @@ export interface FileEntry {
   type: "file" | "dir";
 }
 
+/** Metadata for a single path, from {@link Files.getInfo}. */
+export interface FileInfo {
+  name: string;
+  path: string;
+  type: "file" | "dir";
+  /** Size in bytes. */
+  size: number;
+  /** Octal permission bits, e.g. `"644"`. */
+  mode: string;
+  /** Last modification time. */
+  modifiedAt: Date;
+}
+
 /** Sandbox status as reported by the control plane. */
 export interface SandboxInfo {
   sandboxId: string;
@@ -113,6 +130,18 @@ export interface SandboxInfo {
   createdAt: number;
 }
 
+/** A point-in-time resource sample for a sandbox. */
+export interface SandboxMetrics {
+  /** Consumed CPU time in milliseconds (a counter; resets on restart). */
+  cpuMillis?: number;
+  /** Resident memory of the sandbox VMM process, in MiB. */
+  memMb?: number;
+  /** Host disk consumed by the sandbox's data dir, in MiB. */
+  diskMb?: number;
+  /** Cumulative guest-outbound bytes since boot. */
+  egressBytes?: number;
+}
+
 /** Raw machine JSON from the API (camelCase). Internal. */
 export interface MachineInfoJson {
   name: string;
@@ -121,4 +150,8 @@ export interface MachineInfoJson {
   memoryMb: number;
   pid?: number;
   createdAt: number;
+  cpuMillis?: number;
+  rssMb?: number;
+  diskUsedMb?: number;
+  egressBytes?: number;
 }
