@@ -27,15 +27,34 @@ export interface SandboxOpts extends ConnectionOpts {
   cmd?: string[];
   /** Working directory for the workload. */
   workdir?: string;
+  /**
+   * Guest ports to expose so a service inside the sandbox is reachable through
+   * the preview proxy (`smolvm proxy`). Each becomes a `getHost(port)` URL. The
+   * server auto-allocates the host port. Ports must be declared here at create
+   * time (smolvm can't add them to a running sandbox).
+   */
+  ports?: number[];
+  /**
+   * Base domain for {@link Sandbox.getHost} URLs — the domain your `smolvm proxy`
+   * is reachable at (wildcard `*.<previewDomain>` → the proxy). Everything after
+   * the first dot is ignored by the proxy, so any value routes. Defaults to
+   * `$SMOLVM_PREVIEW_DOMAIN` or `"localhost"`.
+   */
+  previewDomain?: string;
 }
 
 /** Options for reconnecting to a running sandbox. */
-export type ConnectOpts = ConnectionOpts;
+export interface ConnectOpts extends ConnectionOpts {
+  /** Base domain for `getHost` URLs (see {@link SandboxOpts.previewDomain}). */
+  previewDomain?: string;
+}
 
 /** Options for resuming a paused sandbox. */
 export interface ResumeOpts extends ConnectionOpts {
   /** New auto-idle timeout (ms) to arm on resume. */
   timeoutMs?: number;
+  /** Base domain for `getHost` URLs (see {@link SandboxOpts.previewDomain}). */
+  previewDomain?: string;
 }
 
 /** Result of a completed command. */

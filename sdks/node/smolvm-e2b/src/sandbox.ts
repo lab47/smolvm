@@ -45,12 +45,25 @@ export class Sandbox {
   readonly files: Files;
 
   private client: Client;
+  private previewDomain: string;
 
-  private constructor(sandboxId: string, client: Client) {
+  private constructor(sandboxId: string, client: Client, previewDomain?: string) {
     this.sandboxId = sandboxId;
     this.client = client;
+    this.previewDomain =
+      previewDomain ?? process.env.SMOLVM_PREVIEW_DOMAIN ?? "localhost";
     this.commands = new Commands(client, sandboxId);
     this.files = new Files(client, this.commands, sandboxId);
+  }
+
+  /**
+   * Hostname to reach a service running inside the sandbox on `port`, through the
+   * preview proxy — `<port>-<sandboxId>.<previewDomain>`. Prefix with `http://`
+   * or `https://` to form a URL. The port must have been declared in
+   * `Sandbox.create({ ports })`. Mirrors e2b's `getHost`.
+   */
+  getHost(port: number): string {
+    return `${port}-${this.sandboxId}.${this.previewDomain}`;
   }
 
   /** Create and start a new sandbox. */
@@ -68,6 +81,9 @@ export class Sandbox {
       env: opts.envs
         ? Object.entries(opts.envs).map(([name, value]) => ({ name, value }))
         : [],
+      // host 0 → the server auto-allocates a free host port; the preview proxy
+      // resolves the guest→host mapping from the machine info.
+      ports: opts.ports?.map((guest) => ({ host: 0, guest })),
     };
     const created = await client.requestJson<MachineInfoJson>("POST", machinesBase, {
       json: body,
@@ -77,7 +93,7 @@ export class Sandbox {
     await client.requestJson<MachineInfoJson>("POST", `${machinesBase}/${id(created.name)}/start`, {
       timeoutMs: 300_000,
     });
-    return new Sandbox(created.name, client);
+    return new Sandbox(created.name, client, opts.previewDomain);
   }
 
   /** Reconnect to an already-running sandbox by id (no state change). */
@@ -85,7 +101,7 @@ export class Sandbox {
     const client = new Client(opts);
     // Verify it exists (throws NotFoundError otherwise).
     await client.requestJson<MachineInfoJson>("GET", `${machinesBase}/${id(sandboxId)}`);
-    return new Sandbox(sandboxId, client);
+    return new Sandbox(sandboxId, client, opts.previewDomain);
   }
 
   /** Resume a paused sandbox, restoring its running processes. */
@@ -94,7 +110,7 @@ export class Sandbox {
     await client.requestJson<MachineInfoJson>("POST", `${machinesBase}/${id(sandboxId)}/resume`, {
       timeoutMs: 300_000,
     });
-    const sbx = new Sandbox(sandboxId, client);
+    const sbx = new Sandbox(sandboxId, client, opts.previewDomain);
     if (opts.timeoutMs) await sbx.setTimeout(opts.timeoutMs);
     return sbx;
   }

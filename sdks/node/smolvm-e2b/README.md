@@ -85,6 +85,34 @@ Every entry point accepts connection options (or reads `SMOLVM_API_URL` / `SMOLV
 
 `timeoutMs` on `create` (or `setTimeout(ms)`) starts an idle window. Activity (`commands`/`files`) and `setTimeout` push it forward. When it elapses, the control plane **pauses** the sandbox — a suspend-to-disk checkpoint of its full RAM + running processes. `Sandbox.resume(id)` brings it back exactly where it left off, potentially much later. This is how you keep a fleet of sandboxes cheap without losing in-progress work.
 
+## Exposing sandbox services (`getHost`)
+
+Expose a port a service listens on inside the sandbox, then reach it through the **preview proxy** (`smolvm proxy`):
+
+```ts
+const sbx = await Sandbox.create({
+  template: "node:22",
+  ports: [3000],                 // expose guest port 3000
+  previewDomain: "preview.example.com",
+  apiUrl,
+});
+// ...start your server on :3000 inside the sandbox...
+const host = sbx.getHost(3000);  // "3000-<sandboxId>.preview.example.com"
+// → open  https://${host}
+```
+
+Run the proxy (a standalone HTTP server) and point wildcard DNS `*.preview.example.com` at it:
+
+```bash
+smolvm proxy --listen 0.0.0.0:8080 --serve unix:///run/user/1000/smolvm.sock
+```
+
+The proxy takes the **first DNS label** of the `Host` header (`3000-<sandboxId>`) and ignores everything after the first dot, so any base domain works. It resolves the sandbox's auto-allocated host port and forwards HTTP and WebSocket traffic to it. A request to a **paused** sandbox **auto-resumes** it first (e2b behavior), then forwards — so idle sandboxes cost nothing until a request arrives.
+
+Notes and limits:
+- Ports must be declared in `create({ ports })` — smolvm can't add a port to a running sandbox.
+- smolvm has no routable guest IP; the proxy reaches the guest through the published (loopback) host port, which is why the proxy runs alongside the control plane / on the same host as the published ports (or set `--upstream-host` / `SMOLVM_PUBLISH_ADDR`).
+
 ## Errors
 
 `SmolvmError` (base), `NotFoundError` (404), `ConflictError` (409, e.g. resuming a non-paused sandbox), `AuthError` (401/403), and `CommandExitError` (non-zero exit, unless `throwOnError: false`).
