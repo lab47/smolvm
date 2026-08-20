@@ -118,7 +118,10 @@ await pty.exited;
 - `write(path, data)` — `data` is a string or `Uint8Array`.
 - `read(path, { format })` — `"text"` (default) → `string`, `"bytes"` → `Buffer`.
 - `list(dir)`, `remove(path)`, `rename(from, to)`, `exists(path)`, `makeDir(path)`, `getInfo(path)`.
-- `watchDir(path, onEvent, { intervalMs?, recursive? })` — watch for `create`/`modify`/`remove`; returns a watcher with `.stop()`. **Polling-based** (not inotify): smolvm has no guest→host filesystem event stream yet, so it diffs snapshots (default every 1s).
+- `watchDir(path, onEvent, { mode?, install?, intervalMs?, recursive? })` — watch for `create`/`modify`/`remove`; returns a watcher with `.stop()`.
+  - `mode: "inotify"` — **real-time** (~10ms), streamed from `inotifywait` in the sandbox over the SSE exec channel; needs `inotify-tools` (pass `{ install: true }` to `apk`/`apt` it in on demand).
+  - `mode: "poll"` — snapshot-diff every `intervalMs` (default 1s); no dependencies, but misses changes shorter than the interval.
+  - `mode: "auto"` (default) — inotify if available, else poll.
 
 ### Metrics — `sbx.getMetrics()`
 Point-in-time resource sample: `{ cpuMillis, memMb, diskMb, egressBytes }`.

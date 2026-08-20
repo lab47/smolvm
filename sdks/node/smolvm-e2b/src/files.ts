@@ -81,18 +81,114 @@ export class Files {
   }
 
   /**
-   * Watch a directory inside the sandbox for changes, invoking `onEvent` on each
-   * create/modify/remove.
+   * Watch a directory inside the sandbox for `create`/`modify`/`remove`.
    *
-   * NOTE: this is **polling-based** (default every 1s), not inotify — smolvm has
-   * no guest→host filesystem event stream yet, so it diffs directory snapshots
-   * over `commands`. Fine for build-on-change and similar; not sub-second. Call
-   * `.stop()` on the returned watcher to end it.
+   * `mode` (default `"auto"`) chooses the mechanism:
+   * - `"inotify"` — real-time, pushed over the streaming exec channel (needs
+   *   `inotifywait`/`inotify-tools` in the sandbox; pass `{ install: true }` to
+   *   `apk`/`apt` it in on demand).
+   * - `"poll"` — snapshot-diff every `intervalMs` (default 1s); no dependencies.
+   * - `"auto"` — inotify if `inotifywait` is present, otherwise poll.
+   *
+   * Call `.stop()` on the returned watcher to end it.
    */
   async watchDir(
     path: string,
     onEvent: (event: FileEvent) => void,
-    opts: { intervalMs?: number; recursive?: boolean } = {},
+    opts: {
+      intervalMs?: number;
+      recursive?: boolean;
+      mode?: "auto" | "inotify" | "poll";
+      install?: boolean;
+    } = {},
+  ): Promise<FileWatcher> {
+    const mode = opts.mode ?? "auto";
+    if (mode !== "poll") {
+      let hasInotify = await this.hasInotifywait();
+      if (!hasInotify && opts.install) {
+        await this.commands.run(
+          [
+            "sh",
+            "-c",
+            "apk add --no-cache inotify-tools >/dev/null 2>&1 || " +
+              "{ apt-get update >/dev/null 2>&1 && apt-get install -y inotify-tools >/dev/null 2>&1; } || true",
+          ],
+          { throwOnError: false },
+        );
+        hasInotify = await this.hasInotifywait();
+      }
+      if (hasInotify) return this.watchDirInotify(path, onEvent, opts);
+      if (mode === "inotify") {
+        throw new Error(
+          "inotifywait not found in the sandbox — install inotify-tools (or pass { install: true }), or use mode: 'poll'",
+        );
+      }
+    }
+    return this.watchDirPolling(path, onEvent, opts);
+  }
+
+  private async hasInotifywait(): Promise<boolean> {
+    const r = await this.commands.run(["sh", "-c", "command -v inotifywait"], {
+      throwOnError: false,
+    });
+    return r.exitCode === 0;
+  }
+
+  /** Real-time watch: stream `inotifywait -m` output over the SSE exec channel. */
+  private async watchDirInotify(
+    path: string,
+    onEvent: (event: FileEvent) => void,
+    opts: { recursive?: boolean },
+  ): Promise<FileWatcher> {
+    const controller = new AbortController();
+    const recursive = opts.recursive === false ? [] : ["-r"];
+    // close_write (not modify) so one write yields one "modify" event.
+    const cmd = [
+      "inotifywait",
+      "-m",
+      ...recursive,
+      "-e",
+      "create,close_write,delete,move",
+      "--format",
+      "%e|%w|%f",
+      path,
+    ];
+    let ready: () => void;
+    const readyP = new Promise<void>((r) => (ready = r));
+    let buf = "";
+    void this.client
+      .stream(
+        "POST",
+        `/api/v1/machines/${encodeURIComponent(this.sandboxId)}/exec/stream`,
+        { json: { command: cmd }, signal: controller.signal, timeoutMs: 0 },
+        (event, data) => {
+          if (event === "stderr") {
+            if (data.includes("Watches established")) ready();
+            return;
+          }
+          if (event !== "stdout") return;
+          buf += data;
+          let nl: number;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            const ev = parseInotifyLine(line);
+            if (ev) onEvent(ev);
+          }
+        },
+      )
+      .catch(() => {})
+      .finally(() => ready());
+    // Don't report ready until inotify has armed its watches (else early events
+    // are missed); cap the wait so a quiet/odd guest still returns.
+    await Promise.race([readyP, new Promise((r) => setTimeout(r, 3000))]);
+    return { stop: () => controller.abort() };
+  }
+
+  private async watchDirPolling(
+    path: string,
+    onEvent: (event: FileEvent) => void,
+    opts: { intervalMs?: number; recursive?: boolean },
   ): Promise<FileWatcher> {
     const interval = opts.intervalMs ?? 1000;
     const snapshot = async (): Promise<Map<string, string>> => {
@@ -163,4 +259,23 @@ export class Files {
 /** Single-quote a string for safe use in a `sh -c` command. */
 function shq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Parse one `inotifywait --format '%e|%w|%f'` line into a FileEvent, or null
+ * for status lines / unmapped events. */
+function parseInotifyLine(line: string): FileEvent | null {
+  const parts = line.split("|");
+  if (parts.length < 2) return null; // "Setting up watches...", "Watches established."
+  const events = parts[0].split(",");
+  const dir = parts[1];
+  const file = parts[2] ?? "";
+  let type: FileEvent["type"];
+  if (events.includes("CREATE") || events.includes("MOVED_TO")) type = "create";
+  else if (events.includes("DELETE") || events.includes("MOVED_FROM")) type = "remove";
+  else if (events.includes("CLOSE_WRITE") || events.includes("MODIFY")) type = "modify";
+  else return null;
+  const cleanDir = dir.replace(/\/+$/, "");
+  const name = file || cleanDir.split("/").pop() || cleanDir;
+  const path = file ? `${dir.endsWith("/") ? dir : dir + "/"}${file}` : cleanDir;
+  return { type, name, path };
 }

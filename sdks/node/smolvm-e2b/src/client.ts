@@ -67,10 +67,13 @@ export interface RequestOpts {
   contentType?: string;
   /** Expect a raw binary response (returns Buffer) instead of JSON. */
   raw?: boolean;
-  /** Override the client's default per-request timeout for this call. */
+  /** Override the client's default per-request timeout for this call. `0`
+   * disables the inactivity timeout (for long-lived streams like a watch). */
   timeoutMs?: number;
   /** Extra headers. */
   headers?: Record<string, string>;
+  /** Abort the request (destroys the connection). For long-lived streams. */
+  signal?: AbortSignal;
 }
 
 /** Thin JSON/binary HTTP client bound to one smolvm serve endpoint. */
@@ -150,10 +153,21 @@ export class Client {
         });
         res.on("error", (e) => reject(new SmolvmError(`stream error: ${e.message}`)));
       });
-      req.on("error", (e) => reject(new SmolvmError(`request failed: ${e.message}`)));
-      req.setTimeout(timeoutMs, () => {
-        req.destroy(new SmolvmError(`stream timed out after ${timeoutMs}ms: ${method} ${path}`));
-      });
+      req.on("error", (e) => reject(new SmolvmError(`stream failed: ${e.message}`)));
+      // timeoutMs of 0 → no inactivity timeout (long-lived watch streams).
+      if (timeoutMs > 0) {
+        req.setTimeout(timeoutMs, () => {
+          req.destroy(new SmolvmError(`stream timed out after ${timeoutMs}ms: ${method} ${path}`));
+        });
+      }
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          req.destroy();
+          resolve();
+          return;
+        }
+        opts.signal.addEventListener("abort", () => req.destroy(), { once: true });
+      }
       if (payload) req.write(payload);
       req.end();
     });
