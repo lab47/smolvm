@@ -276,6 +276,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/touch", post(handlers::machines::touch_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
+        .route("/{id}/pack", post(handlers::machines::pack_template))
         .route("/{id}", delete(handlers::machines::delete_machine))
         // Exec routes
         .route("/{id}/exec", post(handlers::exec::exec_command))
@@ -362,9 +363,16 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{name}/batches", post(handlers::rollouts::generate_batch))
         .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
 
+    // Locally-stored template artifacts (pre-provisioned sandbox images).
+    let template_routes = Router::new()
+        .route("/", get(handlers::machines::list_templates))
+        .route("/{alias}", get(handlers::machines::get_template))
+        .route("/{alias}", delete(handlers::machines::delete_template));
+
     // API v1 routes
     let api_v1 = Router::new()
         .nest("/machines", machine_routes)
+        .nest("/templates", template_routes)
         .nest("/pools", pool_routes)
         .nest("/rollout-executors", rollout_routes)
         .nest("/volumes", volume_routes);

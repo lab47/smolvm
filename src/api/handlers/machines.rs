@@ -3043,6 +3043,173 @@ pub async fn export_machine(
     }))
 }
 
+/// Directory holding locally-stored template artifacts, a sibling of the per-VM
+/// data dir (`<cache>/smolvm/templates`).
+fn templates_dir() -> std::path::PathBuf {
+    crate::agent::vm_cache_root()
+        .parent()
+        .map(|root| root.join("templates"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/smolvm-templates"))
+}
+
+/// A template alias is used verbatim as a filename, so keep it to safe
+/// characters and reject path-traversal / hidden-file forms.
+fn validate_template_alias(alias: &str) -> Result<(), ApiError> {
+    let ok = !alias.is_empty()
+        && alias.len() <= 128
+        && !alias.starts_with('.')
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "invalid template alias '{alias}': use letters, digits, '-', '_', '.' (not starting with '.')"
+        )))
+    }
+}
+
+fn template_sidecar_path(alias: &str) -> std::path::PathBuf {
+    templates_dir().join(format!("{alias}.smolmachine"))
+}
+
+fn template_info_for(alias: &str, sidecar: &std::path::Path) -> crate::api::types::TemplateInfo {
+    let meta = std::fs::metadata(sidecar).ok();
+    let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let created_at = meta
+        .and_then(|m| m.created().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    crate::api::types::TemplateInfo {
+        alias: alias.to_string(),
+        path: sidecar.to_string_lossy().into_owned(),
+        size_bytes,
+        created_at,
+    }
+}
+
+/// `POST /{id}/pack` — snapshot a STOPPED machine into a locally-stored named
+/// template (`<templates>/<alias>.smolmachine`), for creating sandboxes from a
+/// pre-provisioned image. Unlike `export`, this keeps the artifact local (no
+/// registry). The e2b template-build flow is: create from a base image, run
+/// setup commands, stop, then pack.
+pub async fn pack_template(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(req): Json<crate::api::types::PackTemplateRequest>,
+) -> Result<Json<crate::api::types::TemplateInfo>, ApiError> {
+    validate_template_alias(&req.alias)?;
+    // Same lifecycle-lock + stopped-check discipline as export: a concurrent
+    // start must not boot the VM mid-snapshot.
+    let lifecycle = state.lifecycle_lock(&id);
+    let _guard = lifecycle.lock().await;
+    let record = state
+        .lookup_vm(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", id)))?;
+    let name = id;
+    let name_probe = name.clone();
+    let record_probe = record.clone();
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_machine_state(&name_probe, &record_probe))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    if resolved != RecordState::Stopped {
+        return Err(ApiError::Conflict(
+            "machine must be stopped to pack into a template".to_string(),
+        ));
+    }
+
+    let dir = templates_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ApiError::internal(format!("create templates dir: {}", e)))?;
+    // `pack create -o <dir>/<alias>` emits an executable stub at that path plus
+    // the real sidecar at `<alias>.smolmachine`; we keep only the sidecar.
+    let stub = dir.join(&req.alias);
+    let exe =
+        std::env::current_exe().map_err(|e| ApiError::internal(format!("current_exe: {}", e)))?;
+    let output = tokio::process::Command::new(&exe)
+        .args([
+            "pack",
+            "create",
+            "--from-vm",
+            &name,
+            "-o",
+            &stub.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn pack: {}", e)))?;
+    if !output.status.success() {
+        return Err(ApiError::internal(format!(
+            "pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let sidecar = smolvm_pack::sidecar_path_for(&stub);
+    let artifact = if sidecar.exists() {
+        let _ = std::fs::remove_file(&stub); // drop the executable stub
+        sidecar
+    } else {
+        stub
+    };
+    Ok(Json(template_info_for(&req.alias, &artifact)))
+}
+
+/// `GET /templates` — list locally-stored templates.
+pub async fn list_templates(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<crate::api::types::ListTemplatesResponse>, ApiError> {
+    let dir = templates_dir();
+    let mut templates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("smolmachine") {
+                if let Some(alias) = path.file_stem().and_then(|s| s.to_str()) {
+                    templates.push(template_info_for(alias, &path));
+                }
+            }
+        }
+    }
+    templates.sort_by(|a, b| a.alias.cmp(&b.alias));
+    Ok(Json(crate::api::types::ListTemplatesResponse { templates }))
+}
+
+/// `GET /templates/{alias}` — resolve a template alias to its artifact.
+pub async fn get_template(
+    State(_state): State<Arc<ApiState>>,
+    Path(alias): Path<String>,
+) -> Result<Json<crate::api::types::TemplateInfo>, ApiError> {
+    validate_template_alias(&alias)?;
+    let sidecar = template_sidecar_path(&alias);
+    if !sidecar.is_file() {
+        return Err(ApiError::NotFound(format!("template '{alias}' not found")));
+    }
+    Ok(Json(template_info_for(&alias, &sidecar)))
+}
+
+/// `DELETE /templates/{alias}` — remove a locally-stored template.
+pub async fn delete_template(
+    State(_state): State<Arc<ApiState>>,
+    Path(alias): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    validate_template_alias(&alias)?;
+    let sidecar = template_sidecar_path(&alias);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::NotFound(format!("template '{alias}' not found")));
+        }
+        Err(e) => return Err(ApiError::internal(format!("delete template: {}", e))),
+    }
+    // Remove a leftover stub too, if one was ever kept.
+    let _ = std::fs::remove_file(templates_dir().join(&alias));
+    Ok(Json(DeleteResponse { deleted: alias }))
+}
+
 /// True if `host` is a loopback, link-local, or private-range address — an
 /// SSRF-prone pull destination on a fleet node (its own `127.0.0.1` services, the
 /// cloud metadata endpoint at `169.254.169.254`, or a neighbour on the private

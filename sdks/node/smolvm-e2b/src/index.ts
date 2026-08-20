@@ -28,6 +28,8 @@ export { Commands } from "./commands.js";
 export { Files } from "./files.js";
 export { Pty } from "./pty.js";
 export type { PtyOpts, PtyHandle } from "./pty.js";
+export { Template } from "./template.js";
+export type { TemplateInfo, TemplateBuildOpts } from "./template.js";
 export { Client } from "./client.js";
 export type { ConnectionOpts, RequestOpts } from "./client.js";
 export {

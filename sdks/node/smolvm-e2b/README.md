@@ -107,6 +107,30 @@ await pty.exited;
 ### Metrics — `sbx.getMetrics()`
 Point-in-time resource sample: `{ cpuMillis, memMb, diskMb, egressBytes }`.
 
+## Templates — pre-build an environment once
+
+Bake a base image plus setup steps into a reusable template, then create sandboxes from it with the setup already applied (fast, reproducible):
+
+```ts
+import { Template, Sandbox } from "@smolvm/e2b";
+
+await Template.build({
+  alias: "python-ml",
+  base: "python:3.12",
+  setup: ["pip install numpy pandas", "mkdir -p /workspace"],
+  onLog: (l) => process.stdout.write(l),
+});
+
+// Later — boot from the template; numpy/pandas already installed.
+const sbx = await Sandbox.create({ template: "python-ml" });
+```
+
+- `Template.build({ alias, base, setup, cpus?, memoryMb?, envs?, onLog? })` — provisions a sandbox from `base`, runs each `setup` command, stops it, and snapshots it into a **local** `.smolmachine` (no registry needed). Returns `{ alias, path, sizeBytes, createdAt }`.
+- `Template.list()`, `Template.get(alias)`, `Template.remove(alias)`.
+- `Sandbox.create({ template })` uses a built template if the name matches one; otherwise it's treated as a plain OCI image.
+
+Templates are stored on the control-plane host (`<cache>/smolvm/templates/`), so they're shared by every client of that `smolvm serve`.
+
 ## Auto-idle & warm resume
 
 `timeoutMs` on `create` (or `setTimeout(ms)`) starts an idle window. Activity (`commands`/`files`) and `setTimeout` push it forward. When it elapses, the control plane **pauses** the sandbox — a suspend-to-disk checkpoint of its full RAM + running processes. `Sandbox.resume(id)` brings it back exactly where it left off, potentially much later. This is how you keep a fleet of sandboxes cheap without losing in-progress work.

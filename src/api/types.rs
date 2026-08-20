@@ -247,6 +247,43 @@ pub struct ExportResponse {
     pub manifest: String,
 }
 
+/// Request to snapshot a stopped machine into a locally-stored named template
+/// (a `.smolmachine` under the node's templates dir). Unlike `export`, this keeps
+/// the artifact on the local host — no registry — so sandboxes can be created
+/// from it via `from` / the `template` alias. See [`crate::api::handlers::machines::pack_template`].
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PackTemplateRequest {
+    /// Alias to store the template under (used as the artifact filename). Must be
+    /// a safe name: letters, digits, `-`, `_`, `.`.
+    #[schema(example = "python-ml")]
+    pub alias: String,
+}
+
+/// A locally-stored template artifact.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateInfo {
+    /// Template alias.
+    #[schema(example = "python-ml")]
+    pub alias: String,
+    /// Absolute server path to the `.smolmachine` sidecar; pass as `from` to
+    /// create a sandbox from this template.
+    pub path: String,
+    /// Sidecar size in bytes.
+    #[schema(example = 104857600)]
+    pub size_bytes: u64,
+    /// Creation time (seconds since the Unix epoch).
+    pub created_at: u64,
+}
+
+/// List of locally-stored templates.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListTemplatesResponse {
+    /// The locally-stored templates, sorted by alias.
+    pub templates: Vec<TemplateInfo>,
+}
+
 /// Request to pull a `.smolmachine` artifact into this node's blob cache ahead
 /// of any machine that needs it. See [`crate::api::handlers::prewarm`].
 #[derive(Debug, Deserialize, ToSchema)]

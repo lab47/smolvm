@@ -1,5 +1,6 @@
 import { Client, type ConnectionOpts } from "./client.js";
 import { Commands } from "./commands.js";
+import { NotFoundError, SmolvmError } from "./errors.js";
 import { Files } from "./files.js";
 import { Pty } from "./pty.js";
 import type {
@@ -27,6 +28,21 @@ function matchesMetadata(m: MachineInfoJson, filter?: Record<string, string>): b
   if (!filter) return true;
   const md = m.metadata ?? {};
   return Object.entries(filter).every(([k, v]) => md[k] === v);
+}
+
+/** Resolve a `template` name to a built template's artifact path, or `null` if
+ * it isn't a template (missing, or an invalid alias like an OCI ref). */
+async function resolveTemplate(client: Client, name: string): Promise<{ path: string } | null> {
+  try {
+    return await client.requestJson<{ path: string }>(
+      "GET",
+      `/api/v1/templates/${encodeURIComponent(name)}`,
+    );
+  } catch (e) {
+    if (e instanceof NotFoundError) return null;
+    if (e instanceof SmolvmError && / 400/.test(e.message)) return null;
+    throw e;
+  }
 }
 
 const machinesBase = "/api/v1/machines";
@@ -81,9 +97,21 @@ export class Sandbox {
   /** Create and start a new sandbox. */
   static async create(opts: SandboxOpts = {}): Promise<Sandbox> {
     const client = new Client(opts);
+    // A `template` may be either a built template alias (boot from its artifact)
+    // or a plain OCI image. Resolve the alias; fall back to treating it as an image.
+    let image: string | undefined = opts.template ?? "alpine";
+    let from: string | undefined;
+    if (opts.template) {
+      const tpl = await resolveTemplate(client, opts.template);
+      if (tpl) {
+        from = tpl.path;
+        image = undefined;
+      }
+    }
     const body: Record<string, unknown> = {
       name: opts.sandboxId,
-      image: opts.template ?? "alpine",
+      image,
+      from,
       network: opts.network ?? true,
       cpus: opts.cpus,
       memoryMb: opts.memoryMb,
