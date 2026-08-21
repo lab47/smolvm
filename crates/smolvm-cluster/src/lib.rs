@@ -10,8 +10,11 @@
 //! single-process `serve` path never touches this crate.
 
 pub mod backend;
+pub mod bid;
+pub mod capacity;
 pub mod config;
 pub mod frontend;
+pub mod http;
 pub mod identity;
 pub mod roster;
 pub mod splice;
@@ -20,6 +23,7 @@ pub mod wire;
 mod util;
 
 pub use backend::BackendAgent;
+pub use capacity::{score, BidSpec, CapacitySnapshot, CapacitySource};
 pub use config::{BackendConfig, FrontendConfig, LocalServe, Role, FORWARD_ALPN};
 pub use identity::load_or_generate;
 pub use roster::Roster;

@@ -105,6 +105,45 @@ pub struct ServeStartCmd {
     cluster_bootstrap: Vec<String>,
 }
 
+/// Bridges the serve engine's live capacity signals to the cluster bid scorer.
+/// Reads cheap local signals: host free RAM, running-VM count, active CPU, and
+/// runtime health. Two env hooks let tests skew capacity on a single host:
+/// `SMOLVM_CLUSTER_FAKE_MEM_MB` overrides free RAM, `SMOLVM_CLUSTER_NO_BID=1`
+/// forces a decline.
+struct StateCapacity(Arc<ApiState>);
+
+impl smolvm_cluster::CapacitySource for StateCapacity {
+    fn snapshot(&self) -> smolvm_cluster::CapacitySnapshot {
+        let mem_available_mb = std::env::var("SMOLVM_CLUSTER_FAKE_MEM_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or_else(read_meminfo_available_mb)
+            .unwrap_or(0);
+        let (_total, running) = self.0.machine_counts();
+        let (cpu_used, _rss, _disk) = self.0.real_utilization();
+        let stalled = self.0.runtime_stalled()
+            || std::env::var("SMOLVM_CLUSTER_NO_BID").ok().as_deref() == Some("1");
+        smolvm_cluster::CapacitySnapshot {
+            mem_available_mb,
+            running_vms: running as u32,
+            cpu_used,
+            stalled,
+        }
+    }
+}
+
+/// Host memory available right now, in MiB, from `/proc/meminfo`.
+fn read_meminfo_available_mb() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
 impl ServeStartCmd {
     /// Run the serve command.
     pub fn run(self) -> Result<()> {
@@ -503,9 +542,13 @@ impl ServeStartCmd {
                 key_path: self.cluster_key_path(),
                 bootstrap,
             };
-            let agent = smolvm_cluster::BackendAgent::spawn(cfg).await.map_err(|e| {
-                smolvm::error::Error::config("start cluster backend", e.to_string())
-            })?;
+            let capacity: Arc<dyn smolvm_cluster::CapacitySource> =
+                Arc::new(StateCapacity(state.clone()));
+            let agent = smolvm_cluster::BackendAgent::spawn(cfg, capacity)
+                .await
+                .map_err(|e| {
+                    smolvm::error::Error::config("start cluster backend", e.to_string())
+                })?;
             println!("cluster backend endpoint id: {}", agent.endpoint_id());
             tracing::info!(endpoint_id = %agent.endpoint_id(), "cluster backend agent started");
             Some(agent)

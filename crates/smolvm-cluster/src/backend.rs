@@ -2,6 +2,8 @@
 //! bridges each to this node's own local serve socket, and announces itself on
 //! the gossip topic so the frontend can discover and route to it.
 
+use std::sync::Arc;
+
 use futures_lite::StreamExt;
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
@@ -11,7 +13,9 @@ use iroh_gossip::api::Event;
 use iroh_gossip::net::Gossip;
 use tokio::task::JoinHandle;
 
-use crate::config::{BackendConfig, LocalServe, FORWARD_ALPN};
+use crate::bid::BidProto;
+use crate::capacity::CapacitySource;
+use crate::config::{BackendConfig, LocalServe, BID_ALPN, FORWARD_ALPN};
 use crate::roster::ANNOUNCE_INTERVAL;
 use crate::splice::splice;
 use crate::topic::topic_from_secret;
@@ -71,8 +75,11 @@ pub struct BackendAgent {
 
 impl BackendAgent {
     /// Build the iroh endpoint (persisted identity, n0 discovery), start the
-    /// forward + gossip router, join the topic, and begin announcing.
-    pub async fn spawn(cfg: BackendConfig) -> anyhow::Result<Self> {
+    /// forward + bid + gossip router, join the topic, and begin announcing.
+    pub async fn spawn(
+        cfg: BackendConfig,
+        capacity: Arc<dyn CapacitySource>,
+    ) -> anyhow::Result<Self> {
         let secret = crate::identity::load_or_generate(&cfg.key_path)?;
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret)
@@ -83,6 +90,7 @@ impl BackendAgent {
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(FORWARD_ALPN, ForwardProto { local: cfg.local_serve })
+            .accept(BID_ALPN, BidProto::new(capacity))
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 

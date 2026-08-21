@@ -5,6 +5,13 @@ use std::path::PathBuf;
 /// ALPN for the request-forwarding protocol (frontend → backend serve socket).
 pub const FORWARD_ALPN: &[u8] = b"smolvm/forward/1";
 
+/// ALPN for the capacity-bid protocol (frontend solicits, backend bids).
+pub const BID_ALPN: &[u8] = b"smolvm/bid/1";
+
+/// Default bid-collection deadline (ms). Frontend waits this long for bids on a
+/// new sandbox before placing it. Overridable via SMOLVM_CLUSTER_BID_MS.
+pub const DEFAULT_BID_MS: u64 = 75;
+
 /// Which cluster role this process plays. Absent = today's single process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
