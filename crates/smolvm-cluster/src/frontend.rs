@@ -33,6 +33,7 @@ use crate::bid::{self, Bid};
 use crate::capacity::BidSpec;
 use crate::config::{FrontendConfig, BID_ALPN, DEFAULT_BID_MS, FORWARD_ALPN};
 use crate::http::{self, ReqHead};
+use crate::registry::SandboxRegistry;
 use crate::roster::{Roster, ANNOUNCE_INTERVAL};
 use crate::splice::splice_with_preamble;
 use crate::topic::topic_from_secret;
@@ -53,10 +54,10 @@ struct Frontend {
     fwd_conns: Mutex<HashMap<EndpointId, Connection>>,
     /// Bid connections, one per backend (separate ALPN → separate connection).
     bid_conns: Mutex<HashMap<EndpointId, Connection>>,
-    /// Routing table: machine name → owning backend.
-    table: Mutex<HashMap<String, EndpointId>>,
+    /// Authoritative record of placed sandboxes: sandbox id → owning backend.
+    sandboxes: SandboxRegistry,
     bid_deadline: Duration,
-    name_ctr: AtomicU64,
+    id_ctr: AtomicU64,
 }
 
 impl Frontend {
@@ -102,10 +103,10 @@ impl Frontend {
         self.fwd_conns.lock().await.remove(id);
     }
 
-    /// A native-looking unique machine name.
-    fn gen_name(&self) -> String {
+    /// A fresh, globally-unique sandbox id (which doubles as the machine name).
+    fn gen_sandbox_id(&self) -> String {
         let n = now_millis();
-        let c = self.name_ctr.fetch_add(1, Ordering::Relaxed);
+        let c = self.id_ctr.fetch_add(1, Ordering::Relaxed);
         let mut seed = Vec::with_capacity(16);
         seed.extend_from_slice(&n.to_le_bytes());
         seed.extend_from_slice(&c.to_le_bytes());
@@ -226,40 +227,47 @@ fn roster_json(fe: &Frontend) -> String {
     serde_json::json!({ "count": backends.len(), "backends": backends }).to_string()
 }
 
-/// Outcome of preparing a create request.
-struct Prepared {
+/// A sandbox request the frontend has resolved into something it can place: the
+/// id it will carry, the machine spec to create, and the request body stamped
+/// with that id.
+struct SandboxRequest {
+    /// The sandbox id (also the machine name on whatever backend runs it).
+    id: String,
+    /// The create body, with the sandbox id stamped in as `name`.
     body: Vec<u8>,
-    name: String,
     spec: BidSpec,
-    /// The client supplied the name (so it must be checked for collisions).
-    client_named: bool,
+    /// The client chose the id, so it must be checked for a collision.
+    client_chosen: bool,
 }
 
-/// Assign a name to the create body (honoring a client-supplied one) and derive
-/// the bid spec. Returns `None` if the body isn't a JSON object we can place.
-fn prepare_create(body: &[u8], fe: &Frontend) -> Option<Prepared> {
+/// Turn a create request into a placeable [`SandboxRequest`]: adopt a
+/// client-supplied id or mint a fresh one, stamp it into the body, and read the
+/// spec. Returns `None` if the body isn't a JSON object we can place.
+fn resolve_sandbox_request(body: &[u8], fe: &Frontend) -> Option<SandboxRequest> {
     let mut val: serde_json::Value = serde_json::from_slice(body).ok()?;
     let obj = val.as_object_mut()?;
-    let (name, client_named) = match obj.get("name").and_then(|v| v.as_str()) {
+    let (id, client_chosen) = match obj.get("name").and_then(|v| v.as_str()) {
         Some(n) if !n.is_empty() => (n.to_string(), true),
         _ => {
-            let n = fe.gen_name();
-            obj.insert("name".to_string(), serde_json::Value::String(n.clone()));
-            (n, false)
+            let id = fe.gen_sandbox_id();
+            obj.insert("name".to_string(), serde_json::Value::String(id.clone()));
+            (id, false)
         }
     };
     let mem_mb = obj.get("mem").and_then(|v| v.as_u64()).unwrap_or(NOMINAL_MEM_MB);
     let vcpus = obj.get("cpus").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-    Some(Prepared {
+    Some(SandboxRequest {
+        id,
         body: serde_json::to_vec(&val).ok()?,
-        name,
         spec: BidSpec { mem_mb, vcpus },
-        client_named,
+        client_chosen,
     })
 }
 
-/// Handle `POST /api/v1/machines`: bid, place, record.
-async fn create_flow(
+/// Allocate a sandbox for `POST /api/v1/machines`: choose an id, find the best
+/// backend by bid, materialize the machine there, and record the placement so
+/// every follow-up request routes to it.
+async fn allocate_sandbox(
     fe: Arc<Frontend>,
     mut client: TcpStream,
     head: ReqHead,
@@ -280,7 +288,8 @@ async fn create_flow(
         body.truncate(want);
     }
 
-    let Some(Prepared { body: new_body, name, spec, client_named }) = prepare_create(&body, &fe)
+    let Some(SandboxRequest { id: sandbox, body: create_body, spec, client_chosen }) =
+        resolve_sandbox_request(&body, &fe)
     else {
         respond_json(
             &mut client,
@@ -291,15 +300,15 @@ async fn create_flow(
         return;
     };
 
-    // A client-supplied name must be globally unique across backends. (A frontend
-    // -generated name is random, so we skip the probe.)
-    if client_named {
-        let known = fe.table.lock().await.contains_key(&name);
-        if known || fanout_find_owner(&fe, &name).await.is_some() {
+    // A client-chosen id must be globally unique. (A minted id is random, so it
+    // can't already exist — skip the probe.)
+    if client_chosen {
+        let taken = fe.sandboxes.contains(&sandbox) || fanout_find_owner(&fe, &sandbox).await.is_some();
+        if taken {
             respond_json(
                 &mut client,
                 "409 Conflict",
-                serde_json::json!({"error": format!("machine '{name}' already exists")}).to_string(),
+                serde_json::json!({"error": format!("sandbox '{sandbox}' already exists")}).to_string(),
             )
             .await;
             return;
@@ -307,7 +316,7 @@ async fn create_flow(
     }
 
     let bidders = run_bids(&fe, spec).await;
-    tracing::info!(machine = %name, bidders = bidders.len(), "cluster: bid round complete");
+    tracing::info!(sandbox = %sandbox, bidders = bidders.len(), "cluster: bid round complete");
     if bidders.is_empty() {
         respond_json(
             &mut client,
@@ -318,13 +327,13 @@ async fn create_flow(
         return;
     }
 
-    let request = http::build_request(&head, &new_body);
+    let request = http::build_request(&head, &create_body);
     let mut last: Option<Vec<u8>> = None;
     for (id, addr, score) in bidders.into_iter().take(3) {
         let conn = match fe.fwd_connection(id, addr).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(backend = %id.fmt_short(), error = %e, "create: forward connect failed");
+                tracing::warn!(backend = %id.fmt_short(), error = %e, "allocate: forward connect failed");
                 fe.invalidate_fwd(&id).await;
                 continue;
             }
@@ -332,8 +341,8 @@ async fn create_flow(
         match forward_buffered(&conn, &request).await {
             Ok((status, resp)) if status < 500 && status != 409 => {
                 if status < 300 {
-                    fe.table.lock().await.insert(name.clone(), id);
-                    tracing::info!(machine = %name, backend = %id.fmt_short(), score, "cluster: placed sandbox");
+                    fe.sandboxes.place(&sandbox, id);
+                    tracing::info!(sandbox = %sandbox, backend = %id.fmt_short(), score, "cluster: placed sandbox");
                 }
                 let _ = client.write_all(&resp).await;
                 let _ = client.shutdown().await;
@@ -422,10 +431,14 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
         respond_json(&mut client, "200 OK", roster_json(&fe)).await;
         return;
     }
+    if method == "GET" && route == "/cluster/sandboxes" {
+        respond_json(&mut client, "200 OK", sandboxes_json(&fe)).await;
+        return;
+    }
 
-    // Create: bid + place.
+    // Ask for a sandbox: place it and materialize the machine on the chosen backend.
     if method == "POST" && route == "/api/v1/machines" {
-        create_flow(fe, client, head, buf, body_start).await;
+        allocate_sandbox(fe, client, head, buf, body_start).await;
         return;
     }
 
@@ -435,31 +448,40 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
         return;
     }
 
-    // By-name: route to the owner — the table if known, else a fan-out probe that
-    // repopulates it (so a lost table / frontend restart self-heals). All-miss → 404.
+    // Address a sandbox by id: route to its owner. The registry is the fast path;
+    // a miss (e.g. after a frontend restart) is recovered by a fan-out probe that
+    // repopulates it. Unknown everywhere → 404.
     if let Some(rest) = route.strip_prefix("/api/v1/machines/") {
-        let name = rest.split('/').next().unwrap_or("").to_string();
-        let cached = fe.table.lock().await.get(&name).copied();
-        let target = match cached.and_then(|id| fe.addr_of(id).map(|a| (id, a))) {
+        let sandbox = rest.split('/').next().unwrap_or("").to_string();
+        let located = fe
+            .sandboxes
+            .locate(&sandbox)
+            .and_then(|id| fe.addr_of(id).map(|a| (id, a)));
+        let target = match located {
             Some(t) => Some(t),
-            None => match fanout_find_owner(&fe, &name).await {
+            None => match fanout_find_owner(&fe, &sandbox).await {
                 Some((id, addr)) => {
-                    fe.table.lock().await.insert(name.clone(), id);
+                    fe.sandboxes.place(&sandbox, id);
                     Some((id, addr))
                 }
                 None => None,
             },
         };
-        match target {
-            Some((id, addr)) => tunnel_to(fe, client, id, addr, buf).await,
-            None => {
-                respond_json(
-                    &mut client,
-                    "404 Not Found",
-                    serde_json::json!({"error": format!("machine '{name}' not found")}).to_string(),
-                )
-                .await
-            }
+        let Some((id, addr)) = target else {
+            respond_json(
+                &mut client,
+                "404 Not Found",
+                serde_json::json!({"error": format!("sandbox '{sandbox}' not found")}).to_string(),
+            )
+            .await;
+            return;
+        };
+        // Deleting the sandbox itself is buffered so the placement can be dropped
+        // from the registry once the backend confirms it's gone.
+        if method == "DELETE" && !rest.contains('/') {
+            kill_sandbox(fe, client, head, id, addr, sandbox).await;
+        } else {
+            tunnel_to(fe, client, id, addr, buf).await;
         }
         return;
     }
@@ -475,6 +497,64 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
         return;
     };
     tunnel_to(fe, client, id, addr, buf).await;
+}
+
+/// Delete a sandbox on its owner (buffered), then drop it from the registry so
+/// the frontend's map stays accurate.
+async fn kill_sandbox(
+    fe: Arc<Frontend>,
+    mut client: TcpStream,
+    head: ReqHead,
+    id: EndpointId,
+    addr: EndpointAddr,
+    sandbox: String,
+) {
+    let conn = match fe.fwd_connection(id, addr).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(backend = %id.fmt_short(), error = %e, "kill: forward connect failed");
+            respond_json(
+                &mut client,
+                "502 Bad Gateway",
+                serde_json::json!({"error": "cannot reach sandbox owner"}).to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+    let request = http::build_request(&head, &[]);
+    match forward_buffered(&conn, &request).await {
+        Ok((status, resp)) => {
+            if status < 300 && fe.sandboxes.forget(&sandbox) {
+                tracing::info!(sandbox = %sandbox, "cluster: sandbox killed, dropped from registry");
+            }
+            let _ = client.write_all(&resp).await;
+            let _ = client.shutdown().await;
+        }
+        Err(e) => {
+            tracing::warn!(backend = %id.fmt_short(), error = %e, "kill: forward exchange failed");
+            fe.invalidate_fwd(&id).await;
+            respond_json(
+                &mut client,
+                "502 Bad Gateway",
+                serde_json::json!({"error": "sandbox owner did not respond"}).to_string(),
+            )
+            .await;
+        }
+    }
+}
+
+/// The frontend's sandbox map (id → owning backend), for inspection.
+fn sandboxes_json(fe: &Frontend) -> String {
+    let items: Vec<serde_json::Value> = fe
+        .sandboxes
+        .snapshot()
+        .into_iter()
+        .map(|(sandbox, backend)| {
+            serde_json::json!({ "sandbox": sandbox, "backend": backend.to_string() })
+        })
+        .collect();
+    serde_json::json!({ "count": items.len(), "sandboxes": items }).to_string()
 }
 
 /// Fan out `GET /api/v1/machines` to every backend and merge the machine lists.
@@ -570,9 +650,9 @@ pub async fn run(cfg: FrontendConfig, shutdown: impl Future<Output = ()>) -> any
         roster,
         fwd_conns: Mutex::new(HashMap::new()),
         bid_conns: Mutex::new(HashMap::new()),
-        table: Mutex::new(HashMap::new()),
+        sandboxes: SandboxRegistry::new(),
         bid_deadline: Duration::from_millis(bid_ms),
-        name_ctr: AtomicU64::new(0),
+        id_ctr: AtomicU64::new(0),
     });
 
     let listener = TcpListener::bind(&cfg.listen).await?;

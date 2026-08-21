@@ -16,6 +16,7 @@ pub mod config;
 pub mod frontend;
 pub mod http;
 pub mod identity;
+pub mod registry;
 pub mod roster;
 pub mod splice;
 pub mod topic;
