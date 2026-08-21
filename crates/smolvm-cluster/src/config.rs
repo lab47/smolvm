@@ -41,6 +41,9 @@ pub struct BackendConfig {
     pub local_serve: LocalServe,
     /// Path to persist this node's iroh secret key.
     pub key_path: PathBuf,
+    /// Gossip bootstrap: the frontend's EndpointId(s). The frontend is the seed,
+    /// so each backend joins the topic by dialing it.
+    pub bootstrap: Vec<String>,
 }
 
 /// Frontend cluster config.
@@ -49,8 +52,8 @@ pub struct FrontendConfig {
     pub secret: String,
     /// Public address the frontend's raw HTTP listener binds.
     pub listen: String,
-    /// Bootstrap backend EndpointId(s) (Phase 1: the single static backend to
-    /// forward every request to).
+    /// Optional extra gossip peers to dial. The frontend is the seed, so this is
+    /// normally empty; backends bootstrap to the frontend, not the reverse.
     pub bootstrap: Vec<String>,
     pub key_path: PathBuf,
 }

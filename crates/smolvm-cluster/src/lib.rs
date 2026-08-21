@@ -13,10 +13,14 @@ pub mod backend;
 pub mod config;
 pub mod frontend;
 pub mod identity;
+pub mod roster;
 pub mod splice;
 pub mod topic;
+pub mod wire;
+mod util;
 
 pub use backend::BackendAgent;
 pub use config::{BackendConfig, FrontendConfig, LocalServe, Role, FORWARD_ALPN};
 pub use identity::load_or_generate;
+pub use roster::Roster;
 pub use topic::topic_from_secret;

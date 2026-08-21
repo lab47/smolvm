@@ -13,14 +13,32 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 ///
 /// At the frontend the duplex is the client TCP socket; at the backend it's the
 /// local serve socket. Same helper, both hops.
-pub async fn splice<D>(duplex: D, mut send: SendStream, mut recv: RecvStream)
+pub async fn splice<D>(duplex: D, send: SendStream, recv: RecvStream)
 where
+    D: AsyncRead + AsyncWrite + Send + 'static,
+{
+    splice_with_preamble(duplex, send, recv, Vec::new()).await
+}
+
+/// Like [`splice`], but first writes `preamble` to `send` — used to replay bytes
+/// already read off the client socket (e.g. a peeked request line) into the
+/// tunnel so the backend sees the complete, unmodified request.
+pub async fn splice_with_preamble<D>(
+    duplex: D,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    preamble: Vec<u8>,
+) where
     D: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (mut dr, mut dw) = tokio::io::split(duplex);
 
     // duplex → send (client request bytes, or backend response bytes)
     let up = tokio::spawn(async move {
+        if !preamble.is_empty() && send.write_all(&preamble).await.is_err() {
+            let _ = send.finish();
+            return;
+        }
         let _ = tokio::io::copy(&mut dr, &mut send).await;
         // Signal EOF to the peer so the far side's `recv` copy completes.
         let _ = send.finish();
