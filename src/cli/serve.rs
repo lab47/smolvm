@@ -527,17 +527,18 @@ impl ServeStartCmd {
                     );
                 }
             }
-            let frontend = self.cluster_bootstrap().into_iter().next().ok_or_else(|| {
-                smolvm::error::Error::config(
+            let frontends = self.cluster_bootstrap();
+            if frontends.is_empty() {
+                return Err(smolvm::error::Error::config(
                     "start cluster backend",
-                    "a backend needs --cluster-bootstrap <frontend endpoint id> to dial",
-                )
-            })?;
+                    "a backend needs --cluster-bootstrap <frontend endpoint id> (repeatable) to dial",
+                ));
+            }
             let cfg = smolvm_cluster::BackendConfig {
                 secret: self.cluster_secret()?,
                 local_serve: Self::cluster_local_serve(&listen_target),
                 key_path: self.cluster_key_path(),
-                frontend,
+                frontends,
             };
             let capacity: Arc<dyn smolvm_cluster::CapacitySource> =
                 Arc::new(StateCapacity(state.clone()));

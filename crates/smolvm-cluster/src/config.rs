@@ -54,8 +54,9 @@ pub struct BackendConfig {
     pub local_serve: LocalServe,
     /// Path to persist this node's iroh secret key.
     pub key_path: PathBuf,
-    /// The frontend's EndpointId — the backend dials it and stays connected.
-    pub frontend: String,
+    /// The frontends' EndpointIds — the backend dials and stays connected to
+    /// every one, so any of them can route to it.
+    pub frontends: Vec<String>,
 }
 
 /// Frontend cluster config.

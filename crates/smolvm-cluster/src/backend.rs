@@ -119,8 +119,14 @@ impl BackendAgent {
         let endpoint = builder.bind().await?;
         let id = endpoint.id();
 
-        let frontend = EndpointId::from_str(cfg.frontend.trim())
-            .map_err(|e| anyhow::anyhow!("invalid frontend id {:?}: {e}", cfg.frontend))?;
+        let frontends: Vec<EndpointId> = cfg
+            .frontends
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| EndpointId::from_str(s).map_err(|e| anyhow::anyhow!("invalid frontend id {s:?}: {e}")))
+            .collect::<anyhow::Result<_>>()?;
+        anyhow::ensure!(!frontends.is_empty(), "a backend needs at least one frontend to dial");
         let token = membership_token(&cfg.secret);
         let local = cfg.local_serve;
 
@@ -128,28 +134,35 @@ impl BackendAgent {
             .accept(CLUSTER_ALPN, ForwardProto { local: local.clone() })
             .spawn();
 
-        // Supervisor: keep a live connection to the frontend.
-        let sup_ep = endpoint.clone();
-        let supervisor = tokio::spawn(async move {
-            loop {
-                match sup_ep.connect(frontend, CLUSTER_ALPN).await {
-                    Ok(conn) => {
-                        tracing::info!(frontend = %frontend.fmt_short(), "cluster backend: connected to frontend");
-                        run_connection(conn, capacity.clone(), local.clone(), token.clone()).await;
-                        tracing::info!("cluster backend: frontend connection closed, will redial");
+        // One supervisor per frontend: keep a live connection to each, redialing
+        // on drop. Any frontend can then route to this backend.
+        let mut tasks = Vec::new();
+        for frontend in frontends {
+            let ep = endpoint.clone();
+            let capacity = capacity.clone();
+            let local = local.clone();
+            let token = token.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    match ep.connect(frontend, CLUSTER_ALPN).await {
+                        Ok(conn) => {
+                            tracing::info!(frontend = %frontend.fmt_short(), "cluster backend: connected to frontend");
+                            run_connection(conn, capacity.clone(), local.clone(), token.clone()).await;
+                            tracing::info!(frontend = %frontend.fmt_short(), "cluster backend: connection closed, will redial");
+                        }
+                        Err(e) => {
+                            tracing::debug!(frontend = %frontend.fmt_short(), error = %e, "cluster backend: dial failed");
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "cluster backend: dial to frontend failed");
-                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
+            }));
+        }
 
         Ok(Self {
             endpoint,
             router,
-            tasks: vec![supervisor],
+            tasks,
             id,
         })
     }
