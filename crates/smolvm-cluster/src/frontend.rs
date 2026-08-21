@@ -583,10 +583,8 @@ async fn list_merge(fe: Arc<Frontend>, mut client: TcpStream) {
 /// Run the frontend until `shutdown` resolves.
 pub async fn run(cfg: FrontendConfig, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     let secret = crate::identity::load_or_generate(&cfg.key_path)?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret)
-        .bind()
-        .await?;
+    let builder = crate::util::apply_bind(Endpoint::builder(presets::N0).secret_key(secret))?;
+    let endpoint = builder.bind().await?;
     let id = endpoint.id();
 
     let gossip = Gossip::builder().spawn(endpoint.clone());

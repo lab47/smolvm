@@ -81,10 +81,8 @@ impl BackendAgent {
         capacity: Arc<dyn CapacitySource>,
     ) -> anyhow::Result<Self> {
         let secret = crate::identity::load_or_generate(&cfg.key_path)?;
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret)
-            .bind()
-            .await?;
+        let builder = crate::util::apply_bind(Endpoint::builder(presets::N0).secret_key(secret))?;
+        let endpoint = builder.bind().await?;
         let id = endpoint.id();
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -103,6 +101,14 @@ impl BackendAgent {
 
         // Announce loop: advertise our dialable address on the topic. The first
         // interval tick fires immediately, so the frontend sees us quickly.
+        //
+        // Use broadcast_neighbors, NOT broadcast: an announce is a periodic
+        // heartbeat to our direct neighbors (the frontend), not something to
+        // disseminate multi-hop. broadcast() runs Plumtree, which prunes a node
+        // to lazy-push after the first message and then only sends IHAVE digests,
+        // relying on a GRAFT pull that doesn't reliably complete over a relay hop
+        // — so the frontend would stop hearing announces and evict us. Sending
+        // the full message to neighbors every tick avoids that entirely.
         let announce_ep = endpoint.clone();
         let announce_send = gossip_send.clone();
         tasks.push(tokio::spawn(async move {
@@ -114,7 +120,7 @@ impl BackendAgent {
                     addr: announce_ep.addr(),
                     epoch,
                 };
-                if let Err(e) = announce_send.broadcast(msg.encode()).await {
+                if let Err(e) = announce_send.broadcast_neighbors(msg.encode()).await {
                     tracing::debug!(error = %e, "cluster backend: announce broadcast failed");
                 }
             }
@@ -158,7 +164,7 @@ impl BackendAgent {
     /// Broadcast a graceful Withdraw, stop the router, and close the endpoint.
     pub async fn shutdown(self) {
         let withdraw = ClusterMsg::Withdraw { id: self.id };
-        let _ = self.gossip_send.broadcast(withdraw.encode()).await;
+        let _ = self.gossip_send.broadcast_neighbors(withdraw.encode()).await;
         for t in &self.tasks {
             t.abort();
         }
