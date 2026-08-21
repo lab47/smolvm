@@ -1,0 +1,17 @@
+[package]
+name = "smolvm-cluster"
+version = "1.9.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Optional iroh-based clustering (discovery, bidding, request forwarding) for smolvm serve"
+repository = "https://github.com/smol-machines/smolvm"
+
+[dependencies]
+iroh = "1"
+iroh-gossip = "0.101"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+futures-lite = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+blake3 = "1"

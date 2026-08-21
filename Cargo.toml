@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/smolvm-agent",
+    "crates/smolvm-cluster",
     "crates/smolvm-cuda",
     "crates/smolvm-cuda-guest",
     "crates/smolvm-cuda-shim",
