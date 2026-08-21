@@ -391,14 +391,12 @@ impl ServeStartCmd {
             }
         };
 
-        // The frontend is the gossip seed: it prints its own endpoint id (which
-        // backends bootstrap to) and learns backends from their announcements, so
-        // it needs no bootstrap of its own. Any --cluster-bootstrap given is
-        // treated as optional extra gossip peers.
+        // Backends dial the frontend, so it needs no peer config of its own — it
+        // prints its endpoint id (which backends are pointed at) and discovers
+        // each backend when it connects.
         let cfg = smolvm_cluster::FrontendConfig {
             secret: self.cluster_secret()?,
             listen,
-            bootstrap: self.cluster_bootstrap(),
             key_path: self.cluster_key_path(),
         };
 
@@ -529,18 +527,17 @@ impl ServeStartCmd {
                     );
                 }
             }
-            let bootstrap = self.cluster_bootstrap();
-            if bootstrap.is_empty() {
-                tracing::warn!(
-                    "cluster backend has no --cluster-bootstrap (frontend endpoint id); \
-                     it cannot join the gossip topic and will be invisible to the frontend"
-                );
-            }
+            let frontend = self.cluster_bootstrap().into_iter().next().ok_or_else(|| {
+                smolvm::error::Error::config(
+                    "start cluster backend",
+                    "a backend needs --cluster-bootstrap <frontend endpoint id> to dial",
+                )
+            })?;
             let cfg = smolvm_cluster::BackendConfig {
                 secret: self.cluster_secret()?,
                 local_serve: Self::cluster_local_serve(&listen_target),
                 key_path: self.cluster_key_path(),
-                bootstrap,
+                frontend,
             };
             let capacity: Arc<dyn smolvm_cluster::CapacitySource> =
                 Arc::new(StateCapacity(state.clone()));

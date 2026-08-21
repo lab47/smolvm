@@ -1,23 +1,30 @@
 //! Cluster configuration (roles + connection info). Inert unless a role is set.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-/// ALPN for the request-forwarding protocol (frontend → backend serve socket).
-pub const FORWARD_ALPN: &[u8] = b"smolvm/forward/1";
+/// ALPN for the single cluster connection. Backends dial the frontend on this;
+/// the frontend may dial back on it to obtain a direct path. Forward requests and
+/// capacity pushes are multiplexed as streams over that one connection.
+pub const CLUSTER_ALPN: &[u8] = b"smolvm/cluster/1";
 
-/// ALPN for the capacity-bid protocol (frontend solicits, backend bids).
-pub const BID_ALPN: &[u8] = b"smolvm/bid/1";
+/// How often a backend pushes a capacity update to the frontend.
+pub const CAPACITY_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Default bid-collection deadline (ms). Frontend waits this long for bids on a
-/// new sandbox before placing it. Overridable via SMOLVM_CLUSTER_BID_MS.
-pub const DEFAULT_BID_MS: u64 = 75;
+/// Drop a backend the frontend hasn't heard a capacity push from in this long.
+/// The connection closing removes it immediately; this is the backstop.
+pub const BACKEND_TTL: Duration = Duration::from_secs(10);
+
+/// Nominal memory (MiB) assumed for a create that omits `mem`, used only for the
+/// placement fit gate; real admission still happens on the backend.
+pub const NOMINAL_MEM_MB: u64 = 512;
 
 /// Which cluster role this process plays. Absent = today's single process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Runs VMs; accepts forwarded requests + (later) bids.
+    /// Runs VMs; dials the frontend and serves forwarded requests.
     Backend,
-    /// Public API listener; dispatches to backends. No local VMs.
+    /// Public API listener; accepts backend connections and dispatches to them.
     Frontend,
 }
 
@@ -31,8 +38,7 @@ impl Role {
     }
 }
 
-/// A local serve socket the backend bridges forwarded requests to. Phase 1
-/// supports a Unix socket path (the backend's `-l unix://…`).
+/// A local serve socket the backend bridges forwarded requests to.
 #[derive(Debug, Clone)]
 pub enum LocalServe {
     Unix(PathBuf),
@@ -42,25 +48,22 @@ pub enum LocalServe {
 /// Backend cluster config.
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
-    /// Shared cluster secret (derives the gossip topic; gates membership).
+    /// Shared cluster secret; the backend proves it to the frontend on connect.
     pub secret: String,
     /// The backend's own local serve socket, bridged to on forwarded requests.
     pub local_serve: LocalServe,
     /// Path to persist this node's iroh secret key.
     pub key_path: PathBuf,
-    /// Gossip bootstrap: the frontend's EndpointId(s). The frontend is the seed,
-    /// so each backend joins the topic by dialing it.
-    pub bootstrap: Vec<String>,
+    /// The frontend's EndpointId — the backend dials it and stays connected.
+    pub frontend: String,
 }
 
 /// Frontend cluster config.
 #[derive(Debug, Clone)]
 pub struct FrontendConfig {
+    /// Shared cluster secret; backends must present it to join.
     pub secret: String,
     /// Public address the frontend's raw HTTP listener binds.
     pub listen: String,
-    /// Optional extra gossip peers to dial. The frontend is the seed, so this is
-    /// normally empty; backends bootstrap to the frontend, not the reverse.
-    pub bootstrap: Vec<String>,
     pub key_path: PathBuf,
 }

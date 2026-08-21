@@ -1,34 +1,56 @@
-//! Gossip wire messages. Gossip carries only roster membership — never request
-//! payloads (bidding uses direct bi-streams). Each message is a discrete gossip
-//! broadcast, so we serialize straight to JSON bytes with no length framing.
+//! Wire messages carried over the cluster connection's control stream.
+//!
+//! The data plane (forwarded HTTP requests) is a raw byte tunnel and needs no
+//! framing. The control plane — the backend proving membership and pushing
+//! capacity — is a sequence of length-framed JSON messages on one uni-stream the
+//! backend opens after connecting.
 
-use bytes::Bytes;
-use iroh::{EndpointAddr, EndpointId};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// A roster membership message broadcast over the gossip topic.
+use crate::capacity::CapacitySnapshot;
+
+/// Cap on a single control message.
+const MSG_CAP: usize = 64 * 1024;
+
+/// Control-stream messages, backend → frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClusterMsg {
-    /// A backend advertising itself: its dialable address (id + direct addrs)
-    /// and a monotonic epoch (bumped on restart so stale announces lose).
-    Announce {
-        /// The backend's full address — `addr.id` is the backend id, and the
-        /// direct addrs let the frontend dial without waiting on DNS discovery.
-        addr: EndpointAddr,
-        epoch: u64,
-    },
-    /// A backend leaving gracefully.
-    Withdraw { id: EndpointId },
+pub enum Control {
+    /// First message: proves the backend shares the cluster secret.
+    Hello { token: String },
+    /// Periodic capacity update used for placement.
+    Capacity(CapacitySnapshot),
 }
 
-impl ClusterMsg {
-    /// Serialize for a gossip broadcast. JSON never fails for these types.
-    pub fn encode(&self) -> Bytes {
-        Bytes::from(serde_json::to_vec(self).expect("ClusterMsg serializes"))
-    }
+/// The membership token derived from the shared secret. Sent over iroh's
+/// encrypted, endpoint-authenticated channel, so it's a bearer proof of "knows
+/// the secret", not a replayable password in the clear.
+pub fn membership_token(secret: &str) -> String {
+    blake3::hash(secret.as_bytes()).to_hex().to_string()
+}
 
-    /// Parse a received gossip payload.
-    pub fn decode(bytes: &[u8]) -> anyhow::Result<ClusterMsg> {
-        Ok(serde_json::from_slice(bytes)?)
+/// Length-prefix (4-byte BE) + JSON.
+pub fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
+    let body = serde_json::to_vec(msg).expect("control message serializes");
+    let mut out = (body.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Read one length-framed message from a stream.
+pub async fn read_framed<R, T>(r: &mut R) -> anyhow::Result<T>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await?;
+    let n = u32::from_be_bytes(len) as usize;
+    if n > MSG_CAP {
+        anyhow::bail!("control message too large: {n} bytes");
     }
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).await?;
+    Ok(serde_json::from_slice(&buf)?)
 }
