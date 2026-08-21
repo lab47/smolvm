@@ -154,6 +154,50 @@ async fn forward_buffered(conn: &Connection, request: &[u8]) -> anyhow::Result<(
     Ok((status, resp))
 }
 
+/// Build a minimal internal GET request for fan-out probes.
+fn build_get(path: &str) -> Vec<u8> {
+    format!("GET {path} HTTP/1.1\r\nhost: cluster\r\naccept: application/json\r\nconnection: close\r\n\r\n")
+        .into_bytes()
+}
+
+/// The body slice of a buffered HTTP response (after the header terminator).
+fn response_body(resp: &[u8]) -> &[u8] {
+    match resp.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => &resp[p + 4..],
+        None => &[],
+    }
+}
+
+/// Send `request` (buffered) to every roster backend in parallel. Returns
+/// `(id, status, response_bytes)` for each that answered.
+async fn fanout(fe: &Arc<Frontend>, request: Vec<u8>) -> Vec<(EndpointId, u16, Vec<u8>)> {
+    let mut set: JoinSet<Option<(EndpointId, u16, Vec<u8>)>> = JoinSet::new();
+    for b in fe.roster.snapshot() {
+        let fe = fe.clone();
+        let req = request.clone();
+        set.spawn(async move {
+            let conn = fe.fwd_connection(b.id, b.addr.clone()).await.ok()?;
+            let (status, resp) = forward_buffered(&conn, &req).await.ok()?;
+            Some((b.id, status, resp))
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(t)) = res {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Probe every backend for `name`; the first that returns 200 owns it.
+async fn fanout_find_owner(fe: &Arc<Frontend>, name: &str) -> Option<(EndpointId, EndpointAddr)> {
+    let req = build_get(&format!("/api/v1/machines/{name}"));
+    let answers = fanout(fe, req).await;
+    let (id, _, _) = answers.into_iter().find(|(_, status, _)| *status == 200)?;
+    fe.addr_of(id).map(|addr| (id, addr))
+}
+
 /// Write a small JSON response and close.
 async fn respond_json(client: &mut TcpStream, status: &str, body: String) {
     let resp = format!(
@@ -182,24 +226,36 @@ fn roster_json(fe: &Frontend) -> String {
     serde_json::json!({ "count": backends.len(), "backends": backends }).to_string()
 }
 
+/// Outcome of preparing a create request.
+struct Prepared {
+    body: Vec<u8>,
+    name: String,
+    spec: BidSpec,
+    /// The client supplied the name (so it must be checked for collisions).
+    client_named: bool,
+}
+
 /// Assign a name to the create body (honoring a client-supplied one) and derive
-/// the bid spec. Returns `(rewritten_body, name)`, or `None` if the body isn't a
-/// JSON object we can place.
-fn prepare_create(body: &[u8], fe: &Frontend) -> Option<(Vec<u8>, String, BidSpec)> {
+/// the bid spec. Returns `None` if the body isn't a JSON object we can place.
+fn prepare_create(body: &[u8], fe: &Frontend) -> Option<Prepared> {
     let mut val: serde_json::Value = serde_json::from_slice(body).ok()?;
     let obj = val.as_object_mut()?;
-    let name = match obj.get("name").and_then(|v| v.as_str()) {
-        Some(n) if !n.is_empty() => n.to_string(),
+    let (name, client_named) = match obj.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => (n.to_string(), true),
         _ => {
             let n = fe.gen_name();
             obj.insert("name".to_string(), serde_json::Value::String(n.clone()));
-            n
+            (n, false)
         }
     };
     let mem_mb = obj.get("mem").and_then(|v| v.as_u64()).unwrap_or(NOMINAL_MEM_MB);
     let vcpus = obj.get("cpus").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-    let rewritten = serde_json::to_vec(&val).ok()?;
-    Some((rewritten, name, BidSpec { mem_mb, vcpus }))
+    Some(Prepared {
+        body: serde_json::to_vec(&val).ok()?,
+        name,
+        spec: BidSpec { mem_mb, vcpus },
+        client_named,
+    })
 }
 
 /// Handle `POST /api/v1/machines`: bid, place, record.
@@ -224,7 +280,8 @@ async fn create_flow(
         body.truncate(want);
     }
 
-    let Some((new_body, name, spec)) = prepare_create(&body, &fe) else {
+    let Some(Prepared { body: new_body, name, spec, client_named }) = prepare_create(&body, &fe)
+    else {
         respond_json(
             &mut client,
             "400 Bad Request",
@@ -233,6 +290,21 @@ async fn create_flow(
         .await;
         return;
     };
+
+    // A client-supplied name must be globally unique across backends. (A frontend
+    // -generated name is random, so we skip the probe.)
+    if client_named {
+        let known = fe.table.lock().await.contains_key(&name);
+        if known || fanout_find_owner(&fe, &name).await.is_some() {
+            respond_json(
+                &mut client,
+                "409 Conflict",
+                serde_json::json!({"error": format!("machine '{name}' already exists")}).to_string(),
+            )
+            .await;
+            return;
+        }
+    }
 
     let bidders = run_bids(&fe, spec).await;
     tracing::info!(machine = %name, bidders = bidders.len(), "cluster: bid round complete");
@@ -357,19 +429,43 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
         return;
     }
 
-    // Choose a backend to tunnel to: by-name owner, else lowest-id fallback.
-    let target = if let Some(rest) = route.strip_prefix("/api/v1/machines/") {
-        let name = rest.split('/').next().unwrap_or("");
-        let owner = fe.table.lock().await.get(name).copied();
-        match owner.and_then(|id| fe.addr_of(id).map(|a| (id, a))) {
-            Some(t) => Some(t),
-            None => fe.lowest(),
-        }
-    } else {
-        fe.lowest()
-    };
+    // List: fan out to every backend and merge.
+    if method == "GET" && route == "/api/v1/machines" {
+        list_merge(fe, client).await;
+        return;
+    }
 
-    let Some((id, addr)) = target else {
+    // By-name: route to the owner — the table if known, else a fan-out probe that
+    // repopulates it (so a lost table / frontend restart self-heals). All-miss → 404.
+    if let Some(rest) = route.strip_prefix("/api/v1/machines/") {
+        let name = rest.split('/').next().unwrap_or("").to_string();
+        let cached = fe.table.lock().await.get(&name).copied();
+        let target = match cached.and_then(|id| fe.addr_of(id).map(|a| (id, a))) {
+            Some(t) => Some(t),
+            None => match fanout_find_owner(&fe, &name).await {
+                Some((id, addr)) => {
+                    fe.table.lock().await.insert(name.clone(), id);
+                    Some((id, addr))
+                }
+                None => None,
+            },
+        };
+        match target {
+            Some((id, addr)) => tunnel_to(fe, client, id, addr, buf).await,
+            None => {
+                respond_json(
+                    &mut client,
+                    "404 Not Found",
+                    serde_json::json!({"error": format!("machine '{name}' not found")}).to_string(),
+                )
+                .await
+            }
+        }
+        return;
+    }
+
+    // Anything else: tunnel to the lowest-id backend.
+    let Some((id, addr)) = fe.lowest() else {
         respond_json(
             &mut client,
             "503 Service Unavailable",
@@ -379,6 +475,29 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
         return;
     };
     tunnel_to(fe, client, id, addr, buf).await;
+}
+
+/// Fan out `GET /api/v1/machines` to every backend and merge the machine lists.
+/// A backend that doesn't answer simply drops out of the merged view.
+async fn list_merge(fe: Arc<Frontend>, mut client: TcpStream) {
+    let answers = fanout(&fe, build_get("/api/v1/machines")).await;
+    let mut machines: Vec<serde_json::Value> = Vec::new();
+    for (_, status, resp) in &answers {
+        if *status != 200 {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(response_body(resp)) {
+            if let Some(arr) = v.get("machines").and_then(|m| m.as_array()) {
+                machines.extend(arr.iter().cloned());
+            }
+        }
+    }
+    respond_json(
+        &mut client,
+        "200 OK",
+        serde_json::json!({ "machines": machines }).to_string(),
+    )
+    .await;
 }
 
 /// Run the frontend until `shutdown` resolves.
