@@ -1,50 +1,43 @@
-//! Frontend cluster agent.
+//! Frontend cluster agent — a [`ClusterNode`] in the frontend role, plus the
+//! public HTTP listener that routes over the backend connections it holds.
 //!
-//! Backends dial the frontend and stay connected; the frontend accepts those
-//! connections, verifies membership, and treats the live connection as the whole
-//! of discovery + roster. It never needs to `Endpoint::connect` to a backend to
-//! serve traffic — it opens streams back over the connection the backend brought.
-//! When a backend's inbound path is only a relay, the frontend dials it back to
-//! try for a direct path and prefers that for its (many) forwarded requests.
-//!
-//! Placement uses each backend's periodically-pushed capacity, so there's no
-//! per-create bid round-trip.
+//! The connection/membership machinery lives in [`crate::link`]; this module is
+//! the request router: place creates by pushed capacity, route by-name to the
+//! owning backend (fan-out probe on a cache miss), and merge lists.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_lite::StreamExt;
-use iroh::endpoint::{presets, Connection};
-use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointId};
+use iroh::endpoint::Connection;
+use iroh::EndpointId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
 use crate::backends::BackendTable;
 use crate::capacity::BidSpec;
-use crate::config::{FrontendConfig, CLUSTER_ALPN, NOMINAL_MEM_MB};
+use crate::config::{FrontendConfig, NOMINAL_MEM_MB};
 use crate::http::{self, ReqHead};
+use crate::link::{ClusterNode, NodeKind};
+use crate::membership::{MemberRole, Membership};
 use crate::registry::SandboxRegistry;
 use crate::splice::splice_with_preamble;
 use crate::util::now_millis;
-use crate::wire::{self, membership_token, Control};
+use crate::wire::membership_token;
 
-/// Cap on a buffered response (create / list / probe).
 const RESP_CAP: usize = 4 * 1024 * 1024;
 
-/// Shared frontend state.
-struct Frontend {
-    endpoint: Endpoint,
-    backends: BackendTable,
+/// Routing state for the HTTP listener.
+struct FeState {
+    backends: Arc<BackendTable>,
     sandboxes: SandboxRegistry,
-    token: String,
+    membership: Arc<Membership>,
     id_ctr: AtomicU64,
 }
 
-impl Frontend {
+impl FeState {
     fn gen_sandbox_id(&self) -> String {
         let n = now_millis();
         let c = self.id_ctr.fetch_add(1, Ordering::Relaxed);
@@ -56,105 +49,13 @@ impl Frontend {
         format!("vm-{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
     }
 
-    /// A fallback backend for non-machine paths.
     fn any_backend(&self) -> Option<(EndpointId, Connection)> {
         self.backends.all().into_iter().next()
     }
-
-    /// Handle one accepted backend connection: verify membership, register it,
-    /// consume its capacity pushes, and drop it when the connection ends.
-    async fn handle_backend(self: Arc<Self>, conn: Connection) {
-        let mut recv = match conn.accept_uni().await {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        match wire::read_framed::<_, Control>(&mut recv).await {
-            Ok(Control::Hello { token }) if token == self.token => {}
-            _ => return, // bad/absent token → drop the connection
-        }
-        let id = conn.remote_id();
-        self.backends.register(id, conn.clone());
-        tracing::info!(backend = %id.fmt_short(), "cluster frontend: backend joined");
-
-        // If the inbound path is only a relay, dial back for a direct one.
-        let fe = self.clone();
-        let inbound = conn.clone();
-        tokio::spawn(async move { fe.maybe_dial_direct(id, inbound).await });
-
-        loop {
-            match wire::read_framed::<_, Control>(&mut recv).await {
-                Ok(Control::Capacity(cap)) => self.backends.update_capacity(id, cap),
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        self.backends.remove(&id);
-        tracing::info!(backend = %id.fmt_short(), "cluster frontend: backend left");
-    }
-
-    /// Give the inbound connection a moment to reach a direct path; if it stays on
-    /// the relay, dial the backend ourselves and prefer that path if it's direct.
-    async fn maybe_dial_direct(self: Arc<Self>, id: EndpointId, inbound: Connection) {
-        if wait_for_direct(&inbound, Duration::from_secs(3)).await {
-            return; // inbound already went direct
-        }
-        match self.endpoint.connect(id, CLUSTER_ALPN).await {
-            Ok(direct) => {
-                if wait_for_direct(&direct, Duration::from_secs(5)).await {
-                    self.backends.set_direct(id, direct);
-                    tracing::info!(backend = %id.fmt_short(), "cluster frontend: direct path via dial-back");
-                } else {
-                    tracing::debug!(backend = %id.fmt_short(), "dial-back stayed on relay; keeping inbound");
-                    drop(direct);
-                }
-            }
-            Err(e) => tracing::debug!(backend = %id.fmt_short(), error = %e, "dial-back failed"),
-        }
-    }
 }
 
-/// True once `conn` has a direct (IP) path, or false after `timeout`.
-async fn wait_for_direct(conn: &Connection, timeout: Duration) -> bool {
-    if conn.paths().iter().any(|p| p.is_ip()) {
-        return true;
-    }
-    let mut paths = conn.paths_stream();
-    let sleep = tokio::time::sleep(timeout);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            _ = &mut sleep => return false,
-            next = paths.next() => match next {
-                Some(infos) => if infos.iter().any(|p| p.is_ip()) { return true; },
-                None => return false,
-            },
-        }
-    }
-}
+// ---- forwarding ----
 
-/// Backend connections land here.
-#[derive(Clone)]
-struct BackendAccept {
-    fe: Arc<Frontend>,
-}
-
-impl std::fmt::Debug for BackendAccept {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("BackendAccept")
-    }
-}
-
-impl ProtocolHandler for BackendAccept {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        self.fe.clone().handle_backend(conn).await;
-        Ok(())
-    }
-}
-
-// ---- forwarding over a backend connection ----
-
-/// Buffered request/response over a fresh bi-stream on `conn`. The request
-/// carries `Connection: close`, so the backend closes after responding.
 async fn forward_buffered(conn: &Connection, request: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(request).await?;
@@ -168,8 +69,6 @@ async fn forward_buffered(conn: &Connection, request: &[u8]) -> anyhow::Result<(
     Ok((status, resp))
 }
 
-/// Stream-tunnel the client through a bi-stream on `conn` (preamble = bytes
-/// already read off the client).
 async fn tunnel(conn: Connection, client: TcpStream, preamble: Vec<u8>) {
     match conn.open_bi().await {
         Ok((send, recv)) => splice_with_preamble(client, send, recv, preamble).await,
@@ -189,8 +88,7 @@ fn response_body(resp: &[u8]) -> &[u8] {
     }
 }
 
-/// Send `request` to every backend in parallel; collect `(status, response)`.
-async fn fanout(fe: &Arc<Frontend>, request: Vec<u8>) -> Vec<(EndpointId, u16, Vec<u8>)> {
+async fn fanout(fe: &Arc<FeState>, request: Vec<u8>) -> Vec<(EndpointId, u16, Vec<u8>)> {
     let mut set: JoinSet<Option<(EndpointId, u16, Vec<u8>)>> = JoinSet::new();
     for (id, conn) in fe.backends.all() {
         let req = request.clone();
@@ -208,8 +106,7 @@ async fn fanout(fe: &Arc<Frontend>, request: Vec<u8>) -> Vec<(EndpointId, u16, V
     out
 }
 
-/// Probe every backend for `name`; the first that returns 200 owns it.
-async fn fanout_find_owner(fe: &Arc<Frontend>, name: &str) -> Option<(EndpointId, Connection)> {
+async fn fanout_find_owner(fe: &Arc<FeState>, name: &str) -> Option<(EndpointId, Connection)> {
     let answers = fanout(fe, build_get(&format!("/api/v1/machines/{name}"))).await;
     let (id, _, _) = answers.into_iter().find(|(_, status, _)| *status == 200)?;
     fe.backends.forward_conn(&id).map(|c| (id, c))
@@ -224,24 +121,35 @@ async fn respond_json(client: &mut TcpStream, status: &str, body: String) {
     let _ = client.shutdown().await;
 }
 
-fn backends_json(fe: &Frontend) -> String {
+fn backends_json(fe: &FeState) -> String {
     let items: Vec<serde_json::Value> = fe
         .backends
         .snapshot()
         .into_iter()
         .map(|(id, direct, cap, age_ms)| {
-            serde_json::json!({
-                "id": id.to_string(),
-                "direct_path": direct,
-                "age_ms": age_ms,
-                "capacity": cap,
-            })
+            serde_json::json!({"id": id.to_string(), "direct_path": direct, "age_ms": age_ms, "capacity": cap})
         })
         .collect();
     serde_json::json!({ "count": items.len(), "backends": items }).to_string()
 }
 
-fn sandboxes_json(fe: &Frontend) -> String {
+fn members_json(fe: &FeState) -> String {
+    let items: Vec<serde_json::Value> = fe
+        .membership
+        .snapshot()
+        .into_iter()
+        .map(|(id, role, connected, age_ms)| {
+            let role = match role {
+                MemberRole::Frontend => "frontend",
+                MemberRole::Backend => "backend",
+            };
+            serde_json::json!({"id": id.to_string(), "role": role, "connected": connected, "age_ms": age_ms})
+        })
+        .collect();
+    serde_json::json!({ "count": items.len(), "members": items }).to_string()
+}
+
+fn sandboxes_json(fe: &FeState) -> String {
     let items: Vec<serde_json::Value> = fe
         .sandboxes
         .snapshot()
@@ -260,7 +168,7 @@ struct SandboxRequest {
     client_chosen: bool,
 }
 
-fn resolve_sandbox_request(body: &[u8], fe: &Frontend) -> Option<SandboxRequest> {
+fn resolve_sandbox_request(body: &[u8], fe: &FeState) -> Option<SandboxRequest> {
     let mut val: serde_json::Value = serde_json::from_slice(body).ok()?;
     let obj = val.as_object_mut()?;
     let (id, client_chosen) = match obj.get("name").and_then(|v| v.as_str()) {
@@ -281,7 +189,7 @@ fn resolve_sandbox_request(body: &[u8], fe: &Frontend) -> Option<SandboxRequest>
     })
 }
 
-async fn allocate_sandbox(fe: Arc<Frontend>, mut client: TcpStream, head: ReqHead, mut buf: Vec<u8>, body_start: usize) {
+async fn allocate_sandbox(fe: Arc<FeState>, mut client: TcpStream, head: ReqHead, mut buf: Vec<u8>, body_start: usize) {
     let want = head.content_length().unwrap_or(0);
     let mut body = buf.split_off(body_start);
     let mut tmp = [0u8; 4096];
@@ -310,7 +218,6 @@ async fn allocate_sandbox(fe: Arc<Frontend>, mut client: TcpStream, head: ReqHea
         }
     }
 
-    // Placement: best backends by pushed capacity.
     let candidates = fe.backends.best_for(spec);
     tracing::info!(sandbox = %sandbox, candidates = candidates.len(), "cluster: placing sandbox");
     if candidates.is_empty() {
@@ -347,7 +254,7 @@ async fn allocate_sandbox(fe: Arc<Frontend>, mut client: TcpStream, head: ReqHea
     }
 }
 
-async fn kill_sandbox(fe: Arc<Frontend>, mut client: TcpStream, head: ReqHead, conn: Connection, sandbox: String) {
+async fn kill_sandbox(fe: Arc<FeState>, mut client: TcpStream, head: ReqHead, conn: Connection, sandbox: String) {
     let request = http::build_request(&head, &[]);
     match forward_buffered(&conn, &request).await {
         Ok((status, resp)) => {
@@ -364,7 +271,7 @@ async fn kill_sandbox(fe: Arc<Frontend>, mut client: TcpStream, head: ReqHead, c
     }
 }
 
-async fn list_merge(fe: Arc<Frontend>, mut client: TcpStream) {
+async fn list_merge(fe: Arc<FeState>, mut client: TcpStream) {
     let answers = fanout(&fe, build_get("/api/v1/machines")).await;
     let mut machines: Vec<serde_json::Value> = Vec::new();
     for (_, status, resp) in &answers {
@@ -380,8 +287,7 @@ async fn list_merge(fe: Arc<Frontend>, mut client: TcpStream) {
     respond_json(&mut client, "200 OK", serde_json::json!({ "machines": machines }).to_string()).await;
 }
 
-/// Handle one accepted client connection.
-async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
+async fn serve_client(fe: Arc<FeState>, mut client: TcpStream) {
     let mut buf = Vec::with_capacity(512);
     let body_start = match http::read_headers(&mut client, &mut buf).await {
         Ok(Some(pos)) => pos,
@@ -399,6 +305,10 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
     }
     if method == "GET" && route == "/cluster/roster" {
         respond_json(&mut client, "200 OK", backends_json(&fe)).await;
+        return;
+    }
+    if method == "GET" && route == "/cluster/members" {
+        respond_json(&mut client, "200 OK", members_json(&fe)).await;
         return;
     }
     if method == "GET" && route == "/cluster/sandboxes" {
@@ -439,7 +349,6 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
         return;
     }
 
-    // Anything else: any backend.
     let Some((_id, conn)) = fe.any_backend() else {
         respond_json(&mut client, "503 Service Unavailable", serde_json::json!({"error": "no backend available"}).to_string()).await;
         return;
@@ -450,25 +359,29 @@ async fn serve_client(fe: Arc<Frontend>, mut client: TcpStream) {
 /// Run the frontend until `shutdown` resolves.
 pub async fn run(cfg: FrontendConfig, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     let secret = crate::identity::load_or_generate(&cfg.key_path)?;
-    let builder = crate::util::apply_bind(Endpoint::builder(presets::N0).secret_key(secret))?;
-    let endpoint = builder.bind().await?;
-    let id = endpoint.id();
+    let backends = Arc::new(BackendTable::new());
+    let node = ClusterNode::build(
+        secret,
+        NodeKind::Frontend {
+            backends: backends.clone(),
+        },
+        membership_token(&cfg.secret),
+    )
+    .await?;
+    let seeds = crate::backend::parse_ids(&cfg.seeds)?;
+    node.start(seeds);
 
-    let fe = Arc::new(Frontend {
-        endpoint: endpoint.clone(),
-        backends: BackendTable::new(),
+    let fe = Arc::new(FeState {
+        backends,
         sandboxes: SandboxRegistry::new(),
-        token: membership_token(&cfg.secret),
+        membership: node.membership.clone(),
         id_ctr: AtomicU64::new(0),
     });
 
-    let router = Router::builder(endpoint.clone())
-        .accept(CLUSTER_ALPN, BackendAccept { fe: fe.clone() })
-        .spawn();
-
     let listener = TcpListener::bind(&cfg.listen).await?;
+    let id = node.endpoint_id();
     println!("cluster frontend endpoint id: {id}");
-    tracing::info!(listen = %cfg.listen, endpoint_id = %id, "cluster frontend listening (backends dial in)");
+    tracing::info!(listen = %cfg.listen, endpoint_id = %id, "cluster frontend listening (dynamic membership)");
 
     tokio::pin!(shutdown);
     loop {
@@ -486,7 +399,6 @@ pub async fn run(cfg: FrontendConfig, shutdown: impl Future<Output = ()>) -> any
         }
     }
 
-    let _ = router.shutdown().await;
-    endpoint.close().await;
+    node.shutdown().await;
     Ok(())
 }

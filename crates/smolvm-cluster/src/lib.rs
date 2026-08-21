@@ -18,6 +18,8 @@ pub mod config;
 pub mod frontend;
 pub mod http;
 pub mod identity;
+pub mod link;
+pub mod membership;
 pub mod registry;
 pub mod splice;
 pub mod wire;

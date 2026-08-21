@@ -8,12 +8,9 @@ use std::time::Duration;
 /// capacity pushes are multiplexed as streams over that one connection.
 pub const CLUSTER_ALPN: &[u8] = b"smolvm/cluster/1";
 
-/// How often a backend pushes a capacity update to the frontend.
-pub const CAPACITY_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Drop a backend the frontend hasn't heard a capacity push from in this long.
-/// The connection closing removes it immediately; this is the backstop.
-pub const BACKEND_TTL: Duration = Duration::from_secs(10);
+/// How often each side of a connection sends a control update (membership, and
+/// from backends, capacity).
+pub const CONTROL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Nominal memory (MiB) assumed for a create that omits `mem`, used only for the
 /// placement fit gate; real admission still happens on the backend.
@@ -54,17 +51,21 @@ pub struct BackendConfig {
     pub local_serve: LocalServe,
     /// Path to persist this node's iroh secret key.
     pub key_path: PathBuf,
-    /// The frontends' EndpointIds — the backend dials and stays connected to
-    /// every one, so any of them can route to it.
-    pub frontends: Vec<String>,
+    /// Seed frontend EndpointId(s) to bootstrap from. The backend dials these,
+    /// learns the rest of the cluster's frontends via membership, and connects to
+    /// all of them.
+    pub seeds: Vec<String>,
 }
 
 /// Frontend cluster config.
 #[derive(Debug, Clone)]
 pub struct FrontendConfig {
-    /// Shared cluster secret; backends must present it to join.
+    /// Shared cluster secret; peers must present it to join.
     pub secret: String,
     /// Public address the frontend's raw HTTP listener binds.
     pub listen: String,
     pub key_path: PathBuf,
+    /// Seed frontend EndpointId(s) to join the frontend mesh. Empty for the first
+    /// frontend; later frontends seed off any existing one.
+    pub seeds: Vec<String>,
 }

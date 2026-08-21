@@ -1,31 +1,32 @@
-//! Wire messages carried over the cluster connection's control stream.
-//!
-//! The data plane (forwarded HTTP requests) is a raw byte tunnel and needs no
-//! framing. The control plane — the backend proving membership and pushing
-//! capacity — is a sequence of length-framed JSON messages on one uni-stream the
-//! backend opens after connecting.
+//! Control-plane messages, exchanged over one uni-stream per direction on every
+//! cluster connection. The data plane (forwarded HTTP requests) is a raw byte
+//! tunnel on separate bi-streams and needs no framing.
 
+use iroh::EndpointId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::capacity::CapacitySnapshot;
+use crate::membership::MemberRole;
 
 /// Cap on a single control message.
-const MSG_CAP: usize = 64 * 1024;
+const MSG_CAP: usize = 256 * 1024;
 
-/// Control-stream messages, backend → frontend.
+/// Messages on a control stream, in order: one `Hello`, then a repeating mix of
+/// `Members` and (from backends) `Capacity`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Control {
-    /// First message: proves the backend shares the cluster secret.
-    Hello { token: String },
-    /// Periodic capacity update used for placement.
+    /// First message: the sender's role + proof it shares the cluster secret.
+    Hello { role: MemberRole, token: String },
+    /// The sender's announced membership view.
+    Members(Vec<(EndpointId, MemberRole)>),
+    /// A backend's current capacity (backend → frontend only).
     Capacity(CapacitySnapshot),
 }
 
-/// The membership token derived from the shared secret. Sent over iroh's
-/// encrypted, endpoint-authenticated channel, so it's a bearer proof of "knows
-/// the secret", not a replayable password in the clear.
+/// The membership token derived from the shared secret, sent over iroh's
+/// encrypted, endpoint-authenticated channel.
 pub fn membership_token(secret: &str) -> String {
     blake3::hash(secret.as_bytes()).to_hex().to_string()
 }
