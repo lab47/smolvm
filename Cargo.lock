@@ -4887,6 +4887,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "smolfile",
+ "smolvm-cluster",
  "smolvm-cuda",
  "smolvm-network",
  "smolvm-pack",
@@ -4937,6 +4938,7 @@ dependencies = [
 name = "smolvm-cluster"
 version = "1.9.0"
 dependencies = [
+ "anyhow",
  "blake3",
  "futures-lite",
  "iroh",

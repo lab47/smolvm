@@ -43,6 +43,7 @@ smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.5" }
 smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.7.5" }
 smolvm-pack = { path = "crates/smolvm-pack", version = "1.7.5" }
 smolvm-registry = { path = "crates/smolvm-registry", version = "1.7.5" }
+smolvm-cluster = { path = "crates/smolvm-cluster", version = "1.9.0" }
 smolfile = { path = "crates/smolvm-smolfile", version = "1.7.5" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }

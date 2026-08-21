@@ -86,6 +86,23 @@ pub struct ServeStartCmd {
     /// SMOLVM_LANDLOCK env var takes precedence.
     #[arg(long, value_name = "MODE", default_value = "enforce")]
     landlock: String,
+
+    /// Optional clustering role: `backend` (runs VMs, answers forwarded requests)
+    /// or `frontend` (public API that dispatches to backends over iroh). Omit for
+    /// the default single-process server. Falls back to SMOLVM_CLUSTER.
+    #[arg(long = "cluster-role", value_name = "ROLE")]
+    cluster_role: Option<String>,
+
+    /// Shared cluster secret (falls back to SMOLVM_CLUSTER_SECRET). All nodes in a
+    /// cluster must share it; it derives the gossip topic.
+    #[arg(long = "cluster-secret", value_name = "SECRET")]
+    cluster_secret: Option<String>,
+
+    /// Bootstrap backend endpoint id(s) for a frontend (repeatable; falls back to
+    /// SMOLVM_CLUSTER_BOOTSTRAP, comma-separated). Phase 1 forwards every request
+    /// to the first one.
+    #[arg(long = "cluster-bootstrap", value_name = "ENDPOINT_ID")]
+    cluster_bootstrap: Vec<String>,
 }
 
 impl ServeStartCmd {
@@ -259,7 +276,105 @@ impl ServeStartCmd {
         runtime.block_on(async move { self.run_server(listen_target).await })
     }
 
+    /// Resolve the optional cluster role from the flag or SMOLVM_CLUSTER.
+    fn cluster_role(&self) -> Result<Option<smolvm_cluster::Role>> {
+        let raw = self
+            .cluster_role
+            .clone()
+            .or_else(|| std::env::var("SMOLVM_CLUSTER").ok());
+        match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(None),
+            Some(s) => smolvm_cluster::Role::parse(s).map(Some).ok_or_else(|| {
+                smolvm::error::Error::config(
+                    "resolve cluster role",
+                    format!("unknown cluster role {s:?}; expected `backend` or `frontend`"),
+                )
+            }),
+        }
+    }
+
+    /// Shared cluster secret from the flag or SMOLVM_CLUSTER_SECRET.
+    fn cluster_secret(&self) -> Result<String> {
+        self.cluster_secret
+            .clone()
+            .or_else(|| std::env::var("SMOLVM_CLUSTER_SECRET").ok())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                smolvm::error::Error::config(
+                    "resolve cluster secret",
+                    "clustering requires --cluster-secret or SMOLVM_CLUSTER_SECRET",
+                )
+            })
+    }
+
+    /// Bootstrap backend ids from flags plus SMOLVM_CLUSTER_BOOTSTRAP (comma-sep).
+    fn cluster_bootstrap(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.cluster_bootstrap.clone();
+        if let Ok(env) = std::env::var("SMOLVM_CLUSTER_BOOTSTRAP") {
+            ids.extend(env.split(',').map(|s| s.trim().to_string()));
+        }
+        ids.into_iter().filter(|s| !s.is_empty()).collect()
+    }
+
+    /// Where this node persists its iroh cluster identity (stable EndpointId).
+    fn cluster_key_path(&self) -> std::path::PathBuf {
+        let base = dirs::data_local_dir()
+            .or_else(dirs::data_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("smolvm")
+            .join("node-credentials")
+            .join("cluster.key")
+    }
+
+    /// The backend's own local serve socket, which forwarded requests bridge to.
+    fn cluster_local_serve(listen_target: &ListenTarget) -> smolvm_cluster::LocalServe {
+        match listen_target {
+            #[cfg(unix)]
+            ListenTarget::Unix(path) => smolvm_cluster::LocalServe::Unix(path.clone()),
+            ListenTarget::Tcp(addr) => smolvm_cluster::LocalServe::Tcp(addr.to_string()),
+        }
+    }
+
+    /// Frontend role: a raw TCP listener that tunnels every request to a backend
+    /// over iroh. Runs no local VMs, so it skips the whole VM/supervisor stack.
+    async fn run_frontend(self, listen_target: ListenTarget) -> Result<()> {
+        let listen = match &listen_target {
+            ListenTarget::Tcp(addr) => addr.to_string(),
+            #[cfg(unix)]
+            ListenTarget::Unix(path) => {
+                return Err(smolvm::error::Error::config(
+                    "start cluster frontend",
+                    format!(
+                        "the cluster frontend needs a TCP --listen (got unix://{})",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+
+        let cfg = smolvm_cluster::FrontendConfig {
+            secret: self.cluster_secret()?,
+            listen,
+            bootstrap: self.cluster_bootstrap(),
+            key_path: self.cluster_key_path(),
+        };
+        if cfg.bootstrap.is_empty() {
+            return Err(smolvm::error::Error::config(
+                "start cluster frontend",
+                "a frontend needs at least one --cluster-bootstrap backend id",
+            ));
+        }
+
+        smolvm_cluster::frontend::run(cfg, shutdown_signal())
+            .await
+            .map_err(|e| smolvm::error::Error::config("run cluster frontend", e.to_string()))
+    }
+
     async fn run_server(self, listen_target: ListenTarget) -> Result<()> {
+        if self.cluster_role()? == Some(smolvm_cluster::Role::Frontend) {
+            return self.run_frontend(listen_target).await;
+        }
+
         // On Windows `ListenTarget` has only the `Tcp` variant (Unix-socket
         // listening is unix-gated), making this match irrefutable there.
         #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
@@ -363,6 +478,35 @@ impl ServeStartCmd {
             controller.run().await;
         });
 
+        // Optional clustering: a backend runs today's engine unchanged, plus an
+        // iroh endpoint that bridges forwarded requests to this same local serve
+        // socket. Strictly additive — spawned only when the backend role is set.
+        let cluster_backend = if self.cluster_role()? == Some(smolvm_cluster::Role::Backend) {
+            #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
+            if let ListenTarget::Tcp(addr) = &listen_target {
+                if !addr.ip().is_loopback() && !addr.ip().is_unspecified() {
+                    tracing::warn!(
+                        %addr,
+                        "cluster backend serve socket is not loopback — it should be a \
+                         local-only socket reachable only by the cluster frontend"
+                    );
+                }
+            }
+            let cfg = smolvm_cluster::BackendConfig {
+                secret: self.cluster_secret()?,
+                local_serve: Self::cluster_local_serve(&listen_target),
+                key_path: self.cluster_key_path(),
+            };
+            let agent = smolvm_cluster::BackendAgent::spawn(cfg).await.map_err(|e| {
+                smolvm::error::Error::config("start cluster backend", e.to_string())
+            })?;
+            println!("cluster backend endpoint id: {}", agent.endpoint_id());
+            tracing::info!(endpoint_id = %agent.endpoint_id(), "cluster backend agent started");
+            Some(agent)
+        } else {
+            None
+        };
+
         // Create router
         let drain_state = state.clone();
         // The loopback plain-HTTP door (fleet mode) serves a RESTRICTED router —
@@ -395,6 +539,10 @@ impl ServeStartCmd {
         // particular, a pool fill must not register a newly booted worker after
         // `detach_all` has already walked the registry.
         let _ = shutdown_tx.send(true);
+        if let Some(agent) = cluster_backend {
+            agent.shutdown().await;
+            tracing::debug!("cluster backend agent shut down");
+        }
         let guest_rollout_result = guest_rollout_handle.await.map_err(|error| {
             smolvm::error::Error::config("guest rollout ingress task", error.to_string())
         })?;
