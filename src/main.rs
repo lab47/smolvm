@@ -43,6 +43,9 @@ enum Commands {
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
 
+    /// Inspect a cluster frontend (backends, members, placements, machines)
+    Cluster(cli::cluster::ClusterCmd),
+
     /// Internal: boot a VM subprocess (not for direct use)
     #[command(name = "_boot-vm", hide = true)]
     BootVm {
@@ -174,6 +177,7 @@ fn main() {
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Proxy(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
+        Commands::Cluster(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
