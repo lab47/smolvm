@@ -26,7 +26,8 @@
     "typecheck": "../node_modules/.bin/tsc --noEmit",
     "test": "../node_modules/.bin/vitest run",
     "test:integration": "../node_modules/.bin/vitest run integration-tests",
-    "example:basic": "../node_modules/.bin/tsx examples/basic.ts"
+    "example:basic": "../node_modules/.bin/tsx examples/basic.ts",
+    "example:ifconfig": "../node_modules/.bin/tsx examples/ifconfig.ts"
   },
   "engines": {
     "node": ">= 18.0.0"
