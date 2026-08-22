@@ -193,7 +193,12 @@ export class Client {
       headers["content-type"] = opts.contentType ?? "application/octet-stream";
     }
     if (payload) headers["content-length"] = String(payload.length);
-    if (this.apiKey) headers["authorization"] = `Bearer ${this.apiKey}`;
+    if (this.apiKey) {
+      // Bearer for the smolvm data plane; X-API-Key for the e2b control plane.
+      // Both present is harmless — each surface reads only the header it enforces.
+      headers["authorization"] = `Bearer ${this.apiKey}`;
+      headers["x-api-key"] = this.apiKey;
+    }
     // A Host header is required; any value works for the Unix socket.
     if (this.target.socketPath) headers["host"] = "localhost";
 

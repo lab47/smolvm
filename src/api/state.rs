@@ -22,6 +22,9 @@ struct CpuSample {
 
 /// Shared API server state.
 pub struct ApiState {
+    /// Optional API key required on the e2b `/sandboxes` control surface
+    /// (`X-API-Key`). `None` (unset `SMOLVM_CONTROL_API_KEY`) leaves it open.
+    control_api_key: Option<String>,
     /// Registry of machine managers by name.
     machines: RwLock<HashMap<String, Arc<parking_lot::Mutex<MachineEntry>>>>,
     /// Reserved machine names (creation in progress).
@@ -225,6 +228,11 @@ fn is_dangling_vm_dir(dir_name: &str, valid_hashes: &std::collections::HashSet<S
 }
 
 impl ApiState {
+    /// The configured e2b control API key, if any (`SMOLVM_CONTROL_API_KEY`).
+    pub fn control_api_key(&self) -> Option<&str> {
+        self.control_api_key.as_deref()
+    }
+
     /// Create a new API state, opening the database.
     ///
     /// Returns an error if the database cannot be opened.
@@ -236,6 +244,9 @@ impl ApiState {
             ApiError::internal(format!("failed to initialize database tables: {}", e))
         })?;
         Ok(Self {
+            control_api_key: std::env::var("SMOLVM_CONTROL_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
             machines: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
@@ -254,6 +265,9 @@ impl ApiState {
     /// Useful for testing with temporary databases.
     pub fn with_db(db: SmolvmDb) -> Self {
         Self {
+            control_api_key: std::env::var("SMOLVM_CONTROL_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
             machines: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),

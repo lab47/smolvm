@@ -35,6 +35,9 @@ struct FeState {
     sandboxes: SandboxRegistry,
     membership: Arc<Membership>,
     id_ctr: AtomicU64,
+    /// Optional e2b control API key (`SMOLVM_CONTROL_API_KEY`), enforced on the
+    /// `/sandboxes` paths the frontend terminates and sent on internal probes.
+    control_api_key: Option<String>,
 }
 
 impl FeState {
@@ -287,6 +290,103 @@ async fn list_merge(fe: Arc<FeState>, mut client: TcpStream) {
     respond_json(&mut client, "200 OK", serde_json::json!({ "machines": machines }).to_string()).await;
 }
 
+// ---- e2b control surface (variants of the create/list helpers above) ----
+
+/// `GET` with an `X-API-Key` header, for internal probes to auth-gated backends.
+fn build_get_auth(path: &str, key: Option<&str>) -> Vec<u8> {
+    let mut s = format!("GET {path} HTTP/1.1\r\nhost: cluster\r\naccept: application/json\r\nconnection: close\r\n");
+    if let Some(k) = key {
+        s.push_str("x-api-key: ");
+        s.push_str(k);
+        s.push_str("\r\n");
+    }
+    s.push_str("\r\n");
+    s.into_bytes()
+}
+
+/// e2b `POST /sandboxes`: forward the e2b body unchanged (the backend resolves
+/// the template and auto-starts), then record `sandboxID` → backend from the 2xx
+/// response. Placement uses a nominal spec since e2b bodies carry no size hint.
+async fn allocate_sandbox_e2b(fe: Arc<FeState>, mut client: TcpStream, head: ReqHead, mut buf: Vec<u8>, body_start: usize) {
+    let want = head.content_length().unwrap_or(0);
+    let mut body = buf.split_off(body_start);
+    let mut tmp = [0u8; 4096];
+    while body.len() < want {
+        match client.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+        }
+    }
+    if want > 0 {
+        body.truncate(want);
+    }
+
+    let candidates = fe.backends.best_for(BidSpec { mem_mb: NOMINAL_MEM_MB, vcpus: 1 });
+    if candidates.is_empty() {
+        respond_json(&mut client, "503 Service Unavailable", serde_json::json!({"code":503,"error_code":"unavailable","message":"no backend can host this sandbox"}).to_string()).await;
+        return;
+    }
+
+    let request = http::build_request(&head, &body);
+    let mut last: Option<Vec<u8>> = None;
+    for (id, conn, score) in candidates.into_iter().take(3) {
+        match forward_buffered(&conn, &request).await {
+            Ok((status, resp)) if status < 500 && status != 409 => {
+                if status < 300 {
+                    if let Some(sid) = serde_json::from_slice::<serde_json::Value>(response_body(&resp))
+                        .ok()
+                        .and_then(|v| v.get("sandboxID").and_then(|s| s.as_str().map(String::from)))
+                    {
+                        fe.sandboxes.place(&sid, id);
+                        tracing::info!(sandbox = %sid, backend = %id.fmt_short(), score, "cluster: placed sandbox (e2b)");
+                    }
+                }
+                let _ = client.write_all(&resp).await;
+                let _ = client.shutdown().await;
+                return;
+            }
+            Ok((status, resp)) => {
+                tracing::debug!(backend = %id.fmt_short(), status, "cluster: backend rejected e2b create, trying next");
+                last = Some(resp);
+            }
+            Err(e) => tracing::warn!(backend = %id.fmt_short(), error = %e, "cluster: e2b forward exchange failed"),
+        }
+    }
+    match last {
+        Some(resp) => {
+            let _ = client.write_all(&resp).await;
+            let _ = client.shutdown().await;
+        }
+        None => respond_json(&mut client, "503 Service Unavailable", serde_json::json!({"code":503,"error_code":"unavailable","message":"all backends failed to place sandbox"}).to_string()).await,
+    }
+}
+
+/// e2b `GET /v2/sandboxes`: fan out to each backend's own e2b list handler (with
+/// the control key) and concatenate the arrays, recomputing running totals.
+async fn list_merge_v2(fe: Arc<FeState>, mut client: TcpStream) {
+    let answers = fanout(&fe, build_get_auth("/v2/sandboxes", fe.control_api_key.as_deref())).await;
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    for (_, status, resp) in &answers {
+        if *status != 200 {
+            continue;
+        }
+        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_slice::<serde_json::Value>(response_body(resp)) {
+            merged.extend(arr);
+        }
+    }
+    let running = merged
+        .iter()
+        .filter(|v| v.get("state").and_then(|s| s.as_str()) == Some("running"))
+        .count();
+    let body = serde_json::Value::Array(merged).to_string();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nX-Total-Running: {running}\r\nX-Next-Token: \r\nConnection: close\r\n\r\n{body}",
+        len = body.len(),
+    );
+    let _ = client.write_all(resp.as_bytes()).await;
+    let _ = client.shutdown().await;
+}
+
 async fn serve_client(fe: Arc<FeState>, mut client: TcpStream) {
     let mut buf = Vec::with_capacity(512);
     let body_start = match http::read_headers(&mut client, &mut buf).await {
@@ -313,6 +413,49 @@ async fn serve_client(fe: Arc<FeState>, mut client: TcpStream) {
     }
     if method == "GET" && route == "/cluster/sandboxes" {
         respond_json(&mut client, "200 OK", sandboxes_json(&fe)).await;
+        return;
+    }
+
+    // e2b-shaped control surface: auth (if configured), then place / route / merge.
+    if route == "/sandboxes" || route == "/v2/sandboxes" || route.starts_with("/sandboxes/") {
+        if let Some(expected) = fe.control_api_key.as_deref() {
+            if head.header("x-api-key") != Some(expected) {
+                respond_json(&mut client, "401 Unauthorized", serde_json::json!({"code":401,"error_code":"unauthorized","message":"missing or invalid X-API-Key"}).to_string()).await;
+                return;
+            }
+        }
+        if method == "POST" && route == "/sandboxes" {
+            allocate_sandbox_e2b(fe, client, head, buf, body_start).await;
+            return;
+        }
+        if method == "GET" && route == "/v2/sandboxes" {
+            list_merge_v2(fe, client).await;
+            return;
+        }
+        if let Some(rest) = route.strip_prefix("/sandboxes/") {
+            let sandbox = rest.split('/').next().unwrap_or("").to_string();
+            let target = match fe.sandboxes.locate(&sandbox).and_then(|id| fe.backends.forward_conn(&id).map(|c| (id, c))) {
+                Some(t) => Some(t),
+                None => match fanout_find_owner(&fe, &sandbox).await {
+                    Some((id, conn)) => {
+                        fe.sandboxes.place(&sandbox, id);
+                        Some((id, conn))
+                    }
+                    None => None,
+                },
+            };
+            let Some((_id, conn)) = target else {
+                respond_json(&mut client, "404 Not Found", serde_json::json!({"code":404,"error_code":"not_found","message":format!("sandbox '{sandbox}' not found")}).to_string()).await;
+                return;
+            };
+            if method == "DELETE" && !rest.contains('/') {
+                kill_sandbox(fe, client, head, conn, sandbox).await;
+            } else {
+                tunnel(conn, client, buf).await;
+            }
+            return;
+        }
+        respond_json(&mut client, "404 Not Found", serde_json::json!({"code":404,"error_code":"not_found","message":"unknown sandbox path"}).to_string()).await;
         return;
     }
 
@@ -376,6 +519,9 @@ pub async fn run(cfg: FrontendConfig, shutdown: impl Future<Output = ()>) -> any
         sandboxes: SandboxRegistry::new(),
         membership: node.membership.clone(),
         id_ctr: AtomicU64::new(0),
+        control_api_key: std::env::var("SMOLVM_CONTROL_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
     });
 
     let listener = TcpListener::bind(&cfg.listen).await?;

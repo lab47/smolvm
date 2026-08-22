@@ -1,6 +1,5 @@
 import { Client, type ConnectionOpts } from "./client.js";
 import { Commands } from "./commands.js";
-import { NotFoundError, SmolvmError } from "./errors.js";
 import { Files } from "./files.js";
 import { Pty } from "./pty.js";
 import type {
@@ -9,42 +8,40 @@ import type {
   MachineInfoJson,
   ResumeOpts,
   SandboxInfo,
+  SandboxMetrics,
   SandboxOpts,
 } from "./types.js";
 
-function toInfo(m: MachineInfoJson): SandboxInfo {
+/** e2b `/sandboxes` list item / detail object (the subset we consume). */
+interface SandboxJson {
+  sandboxID: string;
+  templateID?: string;
+  startedAt?: string;
+  cpuCount?: number;
+  memoryMB?: number;
+  state?: string;
+  metadata?: Record<string, string>;
+}
+
+/** e2b create / resume response (the subset we consume). */
+interface SandboxCreateJson {
+  sandboxID: string;
+}
+
+function toInfo(s: SandboxJson): SandboxInfo {
   return {
-    sandboxId: m.name,
-    state: m.state,
-    cpus: m.cpus,
-    memoryMb: m.memoryMb,
-    pid: m.pid,
-    createdAt: m.createdAt,
-    metadata: m.metadata ?? {},
+    sandboxId: s.sandboxID,
+    state: s.state ?? "paused",
+    cpus: s.cpuCount ?? 0,
+    memoryMb: s.memoryMB ?? 0,
+    createdAt: s.startedAt ? Math.floor(Date.parse(s.startedAt) / 1000) : 0,
+    metadata: s.metadata ?? {},
   };
 }
 
-function matchesMetadata(m: MachineInfoJson, filter?: Record<string, string>): boolean {
-  if (!filter) return true;
-  const md = m.metadata ?? {};
-  return Object.entries(filter).every(([k, v]) => md[k] === v);
-}
-
-/** Resolve a `template` name to a built template's artifact path, or `null` if
- * it isn't a template (missing, or an invalid alias like an OCI ref). */
-async function resolveTemplate(client: Client, name: string): Promise<{ path: string } | null> {
-  try {
-    return await client.requestJson<{ path: string }>(
-      "GET",
-      `/api/v1/templates/${encodeURIComponent(name)}`,
-    );
-  } catch (e) {
-    if (e instanceof NotFoundError) return null;
-    if (e instanceof SmolvmError && / 400/.test(e.message)) return null;
-    throw e;
-  }
-}
-
+// Control plane speaks the e2b `/sandboxes` REST shape; the data plane (exec,
+// files, pty) keeps bridging over smolvm's `/api/v1/machines/{id}/...`.
+const sandboxesBase = "/sandboxes";
 const machinesBase = "/api/v1/machines";
 const id = (s: string) => encodeURIComponent(s);
 
@@ -97,79 +94,73 @@ export class Sandbox {
   /** Create and start a new sandbox. */
   static async create(opts: SandboxOpts = {}): Promise<Sandbox> {
     const client = new Client(opts);
-    // A `template` may be either a built template alias (boot from its artifact)
-    // or a plain OCI image. Resolve the alias; fall back to treating it as an image.
-    let image: string | undefined = opts.template ?? "alpine";
-    let from: string | undefined;
-    if (opts.template) {
-      const tpl = await resolveTemplate(client, opts.template);
-      if (tpl) {
-        from = tpl.path;
-        image = undefined;
-      }
-    }
+    // The server resolves `templateID` (built-template alias → its artifact, else
+    // an OCI image, else "alpine") and auto-starts — no client-side resolve/start.
     const body: Record<string, unknown> = {
+      templateID: opts.template,
+      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
+      metadata: opts.metadata,
+      envVars: opts.envs,
+      allow_internet_access: opts.network,
+      // e2b's autoPause is a bool; only "kill" tears the sandbox down on idle,
+      // "pause"/"stop"/unset keep it resumable.
+      autoPause: opts.onTimeout ? opts.onTimeout !== "kill" : undefined,
+      // smolvm extensions (ignored by a stock e2b server, honored by smolvm):
       name: opts.sandboxId,
-      image,
-      from,
-      network: opts.network ?? true,
       cpus: opts.cpus,
       memoryMb: opts.memoryMb,
-      timeoutSecs: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
-      cmd: opts.cmd ?? ["sleep", "infinity"],
+      ports: opts.ports,
+      cmd: opts.cmd,
       workdir: opts.workdir,
-      env: opts.envs
-        ? Object.entries(opts.envs).map(([name, value]) => ({ name, value }))
-        : [],
-      // host 0 → the server auto-allocates a free host port; the preview proxy
-      // resolves the guest→host mapping from the machine info.
-      ports: opts.ports?.map((guest) => ({ host: 0, guest })),
-      onIdle: opts.onTimeout,
-      metadata: opts.metadata,
     };
-    const created = await client.requestJson<MachineInfoJson>("POST", machinesBase, {
+    const created = await client.requestJson<SandboxCreateJson>("POST", sandboxesBase, {
       json: body,
       timeoutMs: 300_000,
     });
-    // create() does not auto-start; bring it up (arms the auto-idle deadline).
-    await client.requestJson<MachineInfoJson>("POST", `${machinesBase}/${id(created.name)}/start`, {
-      timeoutMs: 300_000,
-    });
-    return new Sandbox(created.name, client, opts.previewDomain);
+    return new Sandbox(created.sandboxID, client, opts.previewDomain);
   }
 
   /** Reconnect to an already-running sandbox by id (no state change). */
   static async connect(sandboxId: string, opts: ConnectOpts = {}): Promise<Sandbox> {
     const client = new Client(opts);
     // Verify it exists (throws NotFoundError otherwise).
-    await client.requestJson<MachineInfoJson>("GET", `${machinesBase}/${id(sandboxId)}`);
+    await client.requestJson<SandboxJson>("GET", `${sandboxesBase}/${id(sandboxId)}`);
     return new Sandbox(sandboxId, client, opts.previewDomain);
   }
 
   /** Resume a paused sandbox, restoring its running processes. */
   static async resume(sandboxId: string, opts: ResumeOpts = {}): Promise<Sandbox> {
     const client = new Client(opts);
-    await client.requestJson<MachineInfoJson>("POST", `${machinesBase}/${id(sandboxId)}/resume`, {
-      timeoutMs: 300_000,
-    });
-    const sbx = new Sandbox(sandboxId, client, opts.previewDomain);
-    if (opts.timeoutMs) await sbx.setTimeout(opts.timeoutMs);
-    return sbx;
+    const body = opts.timeoutMs
+      ? { timeout: Math.ceil(opts.timeoutMs / 1000) }
+      : undefined;
+    await client.requestJson<SandboxCreateJson>(
+      "POST",
+      `${sandboxesBase}/${id(sandboxId)}/resume`,
+      { json: body, timeoutMs: 300_000 },
+    );
+    return new Sandbox(sandboxId, client, opts.previewDomain);
   }
 
   /** List sandboxes known to the control plane, optionally filtered by metadata. */
   static async list(opts: ListOpts = {}): Promise<SandboxInfo[]> {
     const client = new Client(opts);
-    const res = await client.requestJson<{ machines: MachineInfoJson[] }>("GET", machinesBase);
-    return (res.machines ?? [])
-      .filter((m) => matchesMetadata(m, opts.metadata))
-      .map(toInfo);
+    let path = "/v2/sandboxes";
+    if (opts.metadata && Object.keys(opts.metadata).length > 0) {
+      // The server filter is a `key=value&key2=value2` string in the `metadata` param.
+      const filter = Object.entries(opts.metadata)
+        .map(([k, v]) => `${k}=${v}`)
+        .join("&");
+      path += `?metadata=${encodeURIComponent(filter)}`;
+    }
+    const items = await client.requestJson<SandboxJson[]>("GET", path);
+    return (items ?? []).map(toInfo);
   }
 
   /** Delete a sandbox by id without needing an instance. */
   static async kill(sandboxId: string, opts: ConnectionOpts = {}): Promise<void> {
     const client = new Client(opts);
-    await client.request("DELETE", `${machinesBase}/${id(sandboxId)}?force=true`);
+    await client.request("DELETE", `${sandboxesBase}/${id(sandboxId)}`);
   }
 
   /**
@@ -178,11 +169,9 @@ export class Sandbox {
    * {@link Sandbox.resume}. The running processes continue on resume.
    */
   async pause(): Promise<string> {
-    await this.client.requestJson<MachineInfoJson>(
-      "POST",
-      `${machinesBase}/${id(this.sandboxId)}/pause`,
-      { timeoutMs: 300_000 },
-    );
+    await this.client.request("POST", `${sandboxesBase}/${id(this.sandboxId)}/pause`, {
+      timeoutMs: 300_000,
+    });
     return this.sandboxId;
   }
 
@@ -191,20 +180,18 @@ export class Sandbox {
    * `timeoutMs` from now unless refreshed again. `0` disables auto-idle.
    */
   async setTimeout(timeoutMs: number): Promise<void> {
-    await this.client.requestJson<MachineInfoJson>(
-      "POST",
-      `${machinesBase}/${id(this.sandboxId)}/timeout`,
-      { json: { timeoutSecs: Math.ceil(timeoutMs / 1000) } },
-    );
+    await this.client.request("POST", `${sandboxesBase}/${id(this.sandboxId)}/timeout`, {
+      json: { timeout: Math.ceil(timeoutMs / 1000) },
+    });
   }
 
   /** Current status of the sandbox. */
   async getInfo(): Promise<SandboxInfo> {
-    const m = await this.client.requestJson<MachineInfoJson>(
+    const s = await this.client.requestJson<SandboxJson>(
       "GET",
-      `${machinesBase}/${id(this.sandboxId)}`,
+      `${sandboxesBase}/${id(this.sandboxId)}`,
     );
-    return toInfo(m);
+    return toInfo(s);
   }
 
   /** Whether the sandbox is currently running. */
@@ -215,9 +202,10 @@ export class Sandbox {
   /**
    * Current resource usage of the sandbox (a point-in-time sample). Empty fields
    * mean the value isn't available (e.g. a paused/stopped sandbox has no live
-   * process to sample).
+   * process to sample). Reads smolvm's richer machine info — the e2b surface
+   * carries no live metrics.
    */
-  async getMetrics(): Promise<import("./types.js").SandboxMetrics> {
+  async getMetrics(): Promise<SandboxMetrics> {
     const m = await this.client.requestJson<MachineInfoJson>(
       "GET",
       `${machinesBase}/${id(this.sandboxId)}`,
@@ -232,6 +220,6 @@ export class Sandbox {
 
   /** Permanently delete the sandbox and its data. */
   async kill(): Promise<void> {
-    await this.client.request("DELETE", `${machinesBase}/${id(this.sandboxId)}?force=true`);
+    await this.client.request("DELETE", `${sandboxesBase}/${id(this.sandboxId)}`);
   }
 }

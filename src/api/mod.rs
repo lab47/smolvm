@@ -19,6 +19,7 @@
 //! ```
 
 pub mod admission;
+pub mod e2b;
 #[cfg(target_os = "linux")]
 pub(crate) mod device_handoff;
 #[path = "errors.rs"]
@@ -377,6 +378,27 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .nest("/rollout-executors", rollout_routes)
         .nest("/volumes", volume_routes);
 
+    // e2b-shaped control surface (additive; maps onto the machine handlers).
+    // Optional X-API-Key auth is applied only here.
+    let sandbox_routes = Router::new()
+        .route("/sandboxes", post(e2b::handlers::create_sandbox))
+        .route("/v2/sandboxes", get(e2b::handlers::list_sandboxes))
+        .route(
+            "/sandboxes/{id}",
+            get(e2b::handlers::get_sandbox).delete(e2b::handlers::delete_sandbox),
+        )
+        .route("/sandboxes/{id}/pause", post(e2b::handlers::pause_sandbox))
+        .route("/sandboxes/{id}/resume", post(e2b::handlers::resume_sandbox))
+        .route("/sandboxes/{id}/timeout", post(e2b::handlers::set_timeout))
+        .route(
+            "/sandboxes/{id}/refreshes",
+            post(e2b::handlers::refresh_sandbox),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            e2b::handlers::require_api_key,
+        ));
+
     let cors = build_cors(cors_origins);
 
     // Prometheus metrics
@@ -390,6 +412,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(p2p_route)
         .merge(warm_route)
         .merge(metrics_route)
+        .merge(sandbox_routes)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(middleware::from_fn(trace_id_middleware))
