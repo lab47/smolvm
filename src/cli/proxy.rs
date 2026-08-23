@@ -10,13 +10,21 @@
 //! sandbox's published host port (auto-allocated at create): it asks the serve
 //! API for the machine, finds the host port mapped to the requested guest port,
 //! and tunnels to `127.0.0.1:<hostPort>`.
+//!
+//! With `--tls-cert`/`--tls-key` it terminates TLS on the listen port using a
+//! static cert (e.g. a Let's Encrypt wildcard), and with `--api-host` it also
+//! reverse-proxies one hostname straight to the serve API — so a single public
+//! endpoint fronts both sandbox previews and the control API.
 
 use clap::Args;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
+
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 use smolvm::error::{Error, Result};
 
@@ -45,6 +53,27 @@ pub struct ProxyCmd {
     /// $SMOLVM_PUBLISH_ADDR if the node widened its bind).
     #[arg(long, value_name = "ADDR")]
     upstream_host: Option<String>,
+
+    /// PEM certificate chain to terminate TLS on the listen port. Requires
+    /// `--tls-key`. A wildcard cert (e.g. `*.sbx.example.com`) covers every
+    /// preview host and the `--api-host`.
+    #[arg(long, value_name = "PATH", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key for `--tls-cert`.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// Hostname that reverse-proxies to the serve API (frontend) instead of a
+    /// sandbox preview — e.g. `api.sbx.example.com`. It has no `<port>-` prefix,
+    /// so it never collides with a preview host.
+    #[arg(long, value_name = "HOST")]
+    api_host: Option<String>,
+
+    /// Also bind this plain-HTTP address and 301-redirect every request to
+    /// `https://` (typically `0.0.0.0:80` alongside a `:443` TLS listen).
+    #[arg(long, value_name = "ADDR:PORT")]
+    redirect_http: Option<String>,
 }
 
 impl ProxyCmd {
@@ -68,18 +97,35 @@ impl ProxyCmd {
             .or_else(|| std::env::var("SMOLVM_PUBLISH_ADDR").ok())
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
-        let cfg = std::sync::Arc::new(ProxyConfig {
+        let cfg = Arc::new(ProxyConfig {
             serve: ServeTarget::parse(&serve_url)?,
             api_key: self.api_key.clone(),
             auto_resume: self.auto_resume,
             upstream_host,
+            api_host: self.api_host.clone(),
             last_touch: Mutex::new(HashMap::new()),
         });
+
+        // Optional plain-HTTP listener that redirects everything to https://.
+        if let Some(addr) = self.redirect_http.clone() {
+            tokio::spawn(async move {
+                if let Err(e) = run_redirect(addr).await {
+                    tracing::warn!(error = %e, "http->https redirect listener stopped");
+                }
+            });
+        }
+
+        let tls = match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Some(build_tls_acceptor(cert, key)?),
+            _ => None,
+        };
 
         let listener = TcpListener::bind(&self.listen).await.map_err(Error::Io)?;
         tracing::info!(
             listen = %self.listen,
             serve = %serve_url,
+            tls = tls.is_some(),
+            api_host = self.api_host.as_deref().unwrap_or("-"),
             auto_resume = self.auto_resume,
             "smolvm preview proxy listening"
         );
@@ -93,12 +139,80 @@ impl ProxyCmd {
                 }
             };
             let cfg = cfg.clone();
+            let tls = tls.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(client, cfg).await {
+                let result = match tls {
+                    Some(acceptor) => match acceptor.accept(client).await {
+                        Ok(stream) => handle_conn(stream, cfg).await,
+                        Err(e) => {
+                            tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                            return;
+                        }
+                    },
+                    None => handle_conn(client, cfg).await,
+                };
+                if let Err(e) = result {
                     tracing::debug!(%peer, error = %e, "connection closed with error");
                 }
             });
         }
+    }
+}
+
+/// Build a TLS acceptor from a PEM cert chain + key, serving TLS with no client
+/// auth (a public server cert — the opposite of the mTLS `serve` path).
+fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<tokio_rustls::TlsAcceptor> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| Error::agent("proxy tls", format!("read cert {}: {e}", cert_path.display())))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::agent("proxy tls", format!("parse cert chain: {e}")))?;
+    if certs.is_empty() {
+        return Err(Error::agent(
+            "proxy tls",
+            format!("cert {} contained no certificates", cert_path.display()),
+        ));
+    }
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| Error::agent("proxy tls", format!("read key {}: {e}", key_path.display())))?;
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::agent("proxy tls", format!("protocol versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::agent("proxy tls", format!("install cert/key: {e}")))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Plain-HTTP listener that 301-redirects every request to its `https://` twin.
+async fn run_redirect(addr: String) -> Result<()> {
+    let listener = TcpListener::bind(&addr).await.map_err(Error::Io)?;
+    tracing::info!(listen = %addr, "http->https redirect listening");
+    loop {
+        let (mut client, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        tokio::spawn(async move {
+            let mut head = Vec::with_capacity(1024);
+            let mut buf = [0u8; 2048];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let host = extract_host(&head).unwrap_or_default();
+            let target = extract_target(&head);
+            let location = format!("https://{host}{target}");
+            let body = "Redirecting to HTTPS.\n";
+            let resp = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = client.write_all(resp.as_bytes()).await;
+            let _ = client.shutdown().await;
+        });
     }
 }
 
@@ -107,6 +221,8 @@ struct ProxyConfig {
     api_key: Option<String>,
     auto_resume: bool,
     upstream_host: String,
+    /// Hostname routed to the serve API instead of a preview (see `--api-host`).
+    api_host: Option<String>,
     /// Per-sandbox time of the last auto-idle refresh, so a busy proxy touches
     /// the control plane at most once per `TOUCH_INTERVAL` rather than per request.
     last_touch: Mutex<HashMap<String, Instant>>,
@@ -147,7 +263,10 @@ const RESUME_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// write.
 const TOUCH_INTERVAL: Duration = Duration::from_secs(15);
 
-async fn handle_conn(mut client: TcpStream, cfg: std::sync::Arc<ProxyConfig>) -> Result<()> {
+async fn handle_conn<S>(mut client: S, cfg: Arc<ProxyConfig>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Read the request head (up to the blank line) so we can route on Host. The
     // bytes we consume here are replayed to the upstream before tunnelling.
     let mut head = Vec::with_capacity(4096);
@@ -170,6 +289,14 @@ async fn handle_conn(mut client: TcpStream, cfg: std::sync::Arc<ProxyConfig>) ->
         Some(h) => h,
         None => return reply(&mut client, 400, "missing Host header").await,
     };
+
+    // The API hostname reverse-proxies straight to the serve API (frontend).
+    if let Some(api_host) = &cfg.api_host {
+        if host_eq(&host, api_host) {
+            return proxy_to_serve(client, head, &cfg).await;
+        }
+    }
+
     let (guest_port, sandbox_id) = match parse_preview_host(&host) {
         Some(v) => v,
         None => {
@@ -446,7 +573,53 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-async fn reply(client: &mut TcpStream, status: u16, message: &str) -> Result<()> {
+/// Reverse-proxy a connection straight to the serve API (used for `--api-host`),
+/// terminating TLS here and forwarding plain HTTP to the (loopback) frontend.
+async fn proxy_to_serve<S>(mut client: S, head: Vec<u8>, cfg: &ProxyConfig) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match &cfg.serve {
+        ServeTarget::Tcp(addr) => match TcpStream::connect(addr).await {
+            Ok(mut up) => {
+                up.write_all(&head).await.map_err(Error::Io)?;
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+            }
+            Err(e) => {
+                tracing::warn!(%addr, error = %e, "serve connect failed");
+                return reply(&mut client, 502, "control API is not reachable").await;
+            }
+        },
+        ServeTarget::Unix(path) => match UnixStream::connect(path).await {
+            Ok(mut up) => {
+                up.write_all(&head).await.map_err(Error::Io)?;
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+            }
+            Err(e) => {
+                tracing::warn!(%path, error = %e, "serve connect failed");
+                return reply(&mut client, 502, "control API is not reachable").await;
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Case-insensitive Host match, ignoring any `:port` suffix.
+fn host_eq(host: &str, want: &str) -> bool {
+    host.split(':').next().unwrap_or(host).eq_ignore_ascii_case(want)
+}
+
+/// The request target (path) from an HTTP request line, defaulting to `/`.
+fn extract_target(head: &[u8]) -> String {
+    let end = head.windows(2).position(|w| w == b"\r\n").unwrap_or(head.len());
+    String::from_utf8_lossy(&head[..end])
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string()
+}
+
+async fn reply<S: AsyncWrite + Unpin>(client: &mut S, status: u16, message: &str) -> Result<()> {
     let reason = match status {
         400 => "Bad Request",
         404 => "Not Found",
