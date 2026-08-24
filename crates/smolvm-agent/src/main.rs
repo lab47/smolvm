@@ -1178,13 +1178,19 @@ fn setup_persistent_rootfs() {
     };
 
     if !mounted {
-        // First boot — format the disk
+        // First boot — format the disk. Keep the ext4 journal (bounded to 64MB):
+        // VMs are stopped/hibernated without unmounting this disk, so it is always
+        // left "not clean". Without a journal there is no way to recover metadata
+        // that was torn or uncommitted at stop time, and with metadata_csum on, the
+        // next write to such a block fails its checksum as EFSBADCRC (EBADMSG) — e.g.
+        // the overlay bundle's rootfs symlink on the implicit-start/wake path. The
+        // journal replays on mount and heals it.
         let _ = std::process::Command::new("mkfs.ext4")
             .args([
                 "-F",
                 "-q",
-                "-O",
-                "^has_journal",
+                "-J",
+                "size=64",
                 "-L",
                 "smolvm-overlay",
                 OVERLAY_DEVICE,
@@ -1745,9 +1751,14 @@ fn mount_storage_disk() -> bool {
     }
 
     // --- Attempt 3: mkfs (last resort, destroys data) ---
+    // Keep the ext4 journal (bounded to 64MB): this disk is stopped/hibernated
+    // without a clean unmount, so it is always left "not clean". Without a journal
+    // there is no recovery of torn/uncommitted metadata, and metadata_csum then
+    // surfaces the inconsistency as EFSBADCRC (EBADMSG) on the next write — e.g. the
+    // overlay bundle symlink on the wake path. The journal replays on mount instead.
     info!("formatting storage disk (first boot or unrecoverable)");
     match Command::new("mkfs.ext4")
-        .args(["-F", "-q", "-O", "^has_journal", STORAGE_DEVICE])
+        .args(["-F", "-q", "-J", "size=64", STORAGE_DEVICE])
         .status()
     {
         Ok(status) if status.success() => {}

@@ -231,12 +231,17 @@ pub(crate) fn format_disk_with_mkfs<D: DiskType>(disk_path: &Path) -> Result<()>
             // a host root filesystem, so holding capacity back for root is just
             // wasted space.
             "0",
-            // Specify ext4 feature flags explicitly.
-            "-O",
-            // Disable the journal. These disks are scratch/data images managed
-            // by a VM, and dropping the journal reduces write amplification and
-            // space overhead for our use case.
-            "^has_journal",
+            // Keep the ext4 journal, but bound it to 64MB to limit the footprint
+            // on these otherwise-tiny sparse images. The journal is required for
+            // correctness here: VMs are stopped/hibernated without unmounting
+            // these disks, so ext4 is always left "not clean". Without a journal
+            // there is no recovery of metadata that was torn or uncommitted at
+            // stop time, and because these images carry metadata_csum, the next
+            // write to such a block fails its checksum as EFSBADCRC (EBADMSG) —
+            // e.g. the overlay bundle's rootfs symlink on the implicit-start/wake
+            // path. The journal replays on the next mount and heals the metadata.
+            "-J",
+            "size=64",
             // Set the filesystem label.
             "-L",
             // The label lets the guest-side tooling distinguish storage and
