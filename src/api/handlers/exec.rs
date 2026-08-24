@@ -414,7 +414,9 @@ pub async fn run_command(
 /// Query parameters for an interactive PTY session.
 #[derive(Debug, serde::Deserialize)]
 pub struct InteractiveQuery {
-    /// Program to run (single argv[0]); defaults to `/bin/sh`.
+    /// Command line to run in the PTY, executed via `sh -c` (so a full command
+    /// with arguments works, e.g. `bash -lc '...'`). Defaults to an interactive
+    /// `/bin/sh`.
     pub cmd: Option<String>,
     /// Initial terminal width in columns.
     pub cols: Option<u16>,
@@ -446,7 +448,13 @@ pub async fn exec_interactive(
 
     let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
 
-    let command = vec![q.cmd.clone().unwrap_or_else(|| "/bin/sh".to_string())];
+    // Run a provided command line through a shell so multi-word commands and
+    // shell syntax work (e.g. `bash -lc '...'`); a bare program still runs. With
+    // no cmd, drop into an interactive shell.
+    let command = match q.cmd.clone() {
+        Some(c) => vec!["/bin/sh".to_string(), "-c".to_string(), c],
+        None => vec!["/bin/sh".to_string()],
+    };
     let init_size = (q.cols.unwrap_or(80), q.rows.unwrap_or(24));
 
     // Snapshot mounts now (used only for image runs) so the upgrade closure

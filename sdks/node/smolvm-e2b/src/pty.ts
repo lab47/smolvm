@@ -2,7 +2,8 @@ import type { Client } from "./client.js";
 
 /** Options for {@link Pty.create}. */
 export interface PtyOpts {
-  /** Program to run (single argv[0]); defaults to `/bin/sh`. */
+  /** Command line to run, executed via `sh -c` (so args and shell syntax work,
+   * e.g. `bash -lc '...'`). Defaults to an interactive `/bin/sh`. */
   cmd?: string;
   /** Terminal width in columns (default 80). */
   cols?: number;
