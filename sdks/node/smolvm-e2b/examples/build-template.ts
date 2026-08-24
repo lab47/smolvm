@@ -1,15 +1,15 @@
 /**
- * Build a "dev" smolvm template: Ubuntu 26.04 + latest Go, Rust (rustup), Node,
+ * Build the "default" smolvm template: Ubuntu 26.04 + latest Go, Rust (rustup), Node,
  * Bun, and Ruby (via rbenv + ruby-build for easy version switches). Provisions a
  * build sandbox, runs the setup steps, then snapshots it into a named template
- * so `Sandbox.create({ template: "dev" })` boots it fast.
+ * so `Sandbox.create({ template: "default" })` boots it fast.
  *
  *   SMOLVM_API_KEY=<key> npm run example:build-template
  *
  * Env:
  *   SMOLVM_API_URL   (default https://api.sbx.eu0.lab47.dev)
  *   SMOLVM_API_KEY   (required — control-plane X-API-Key)
- *   TEMPLATE_ALIAS   (default "dev")
+ *   TEMPLATE_ALIAS   (default "default")
  *   TEMPLATE_BASE    (default "ubuntu:26.04")
  */
 import { Sandbox, Client } from "../src/index.js";
@@ -20,7 +20,7 @@ if (!apiKey) {
   process.exit(1);
 }
 const opts = { apiUrl: process.env.SMOLVM_API_URL ?? "https://api.sbx.eu0.lab47.dev", apiKey };
-const ALIAS = process.env.TEMPLATE_ALIAS ?? "dev";
+const ALIAS = process.env.TEMPLATE_ALIAS ?? "default";
 const BASE = process.env.TEMPLATE_BASE ?? "ubuntu:26.04";
 
 const MIN = 60_000;
