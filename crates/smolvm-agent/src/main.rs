@@ -201,7 +201,34 @@ fn maybe_set_clock_from_host() {
     let _ = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
 }
 
+/// Raise `RLIMIT_NOFILE` as high as the kernel allows, preferring a generous
+/// soft limit with a high hard cap so tests can raise their own soft further.
+/// Tries progressively lower targets so it always lands above the 1024 default.
+#[cfg(target_os = "linux")]
+fn raise_nofile_limit() {
+    for (soft, hard) in [(16384u64, 1_048_576u64), (16384, 65536), (8192, 8192), (4096, 4096)] {
+        let lim = libc::rlimit {
+            rlim_cur: soft,
+            rlim_max: hard,
+        };
+        // SAFETY: setrlimit with a valid rlimit pointer; failure is tolerated
+        // (we fall through to a lower target).
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+            break;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn raise_nofile_limit() {}
+
 fn main() {
+    // Raise the open-file limit before anything forks: crun (and its `crun exec`
+    // for command.run) inherit the agent's rlimit, and the guest-kernel default
+    // of 1024/4096 is too low for process-heavy server test suites (Puma hits
+    // EMFILE). The agent is root in the VM, so it can raise the hard cap.
+    raise_nofile_limit();
+
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
     }

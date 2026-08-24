@@ -1512,24 +1512,59 @@ fn spawn_pod_exec(
 /// binaries (e.g. `id`) resolve.
 #[cfg(target_os = "linux")]
 fn prepare_exec_process_json(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
-    const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const DEFAULT_PATH: &str =
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     let mut v: serde_json::Value = serde_json::from_str(raw)?;
     v["terminal"] = serde_json::Value::Bool(false);
-    let has_path = v
+    // A PATH so bare-name binaries (e.g. `id`) resolve, plus sensible server
+    // defaults the caller can still override: a UTF-8 locale (so tools don't hit
+    // "invalid byte sequence in US-ASCII") and a generous open-file limit
+    // (1024/4096 is too low for process-heavy suites — Puma etc. hit EMFILE).
+    ensure_env_default(&mut v, "PATH", DEFAULT_PATH);
+    ensure_env_default(&mut v, "LANG", "C.UTF-8");
+    ensure_env_default(&mut v, "LC_ALL", "C.UTF-8");
+    ensure_nofile_rlimit(&mut v, 16384, 1_048_576);
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// Add `KEY=VAL` to the process `env` unless a `KEY=` entry is already present.
+fn ensure_env_default(v: &mut serde_json::Value, key: &str, val: &str) {
+    let prefix = format!("{key}=");
+    let present = v
         .get("env")
         .and_then(|e| e.as_array())
         .map(|a| {
             a.iter()
-                .any(|x| x.as_str().map(|s| s.starts_with("PATH=")).unwrap_or(false))
+                .any(|x| x.as_str().map(|s| s.starts_with(&prefix)).unwrap_or(false))
         })
         .unwrap_or(false);
-    if !has_path {
+    if !present {
+        let entry = serde_json::Value::String(format!("{key}={val}"));
         match v.get_mut("env").and_then(|e| e.as_array_mut()) {
-            Some(env) => env.push(serde_json::Value::String(DEFAULT_PATH.to_string())),
-            None => v["env"] = serde_json::json!([DEFAULT_PATH]),
+            Some(env) => env.push(entry),
+            None => v["env"] = serde_json::Value::Array(vec![entry]),
         }
     }
-    Ok(serde_json::to_string(&v)?)
+}
+
+/// Add a `RLIMIT_NOFILE` process rlimit unless one is already set. The container
+/// carries `CAP_SYS_RESOURCE`, so crun can raise the hard cap for the exec.
+fn ensure_nofile_rlimit(v: &mut serde_json::Value, soft: u64, hard: u64) {
+    let present = v
+        .get("rlimits")
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .any(|x| x.get("type").and_then(|t| t.as_str()) == Some("RLIMIT_NOFILE"))
+        })
+        .unwrap_or(false);
+    if !present {
+        let entry = serde_json::json!({ "type": "RLIMIT_NOFILE", "hard": hard, "soft": soft });
+        match v.get_mut("rlimits").and_then(|r| r.as_array_mut()) {
+            Some(rl) => rl.push(entry),
+            None => v["rlimits"] = serde_json::json!([entry]),
+        }
+    }
 }
 
 /// Start a previously registered exec process inside the running container

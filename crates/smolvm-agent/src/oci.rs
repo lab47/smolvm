@@ -501,6 +501,13 @@ impl OciSpec {
                 env_strings.push(format!("HOME={home}"));
             }
         }
+        // A UTF-8 locale by default so tools don't hit "invalid byte sequence in
+        // US-ASCII"; caller-provided values still win (appended after).
+        for (key, val) in [("LANG", "C.UTF-8"), ("LC_ALL", "C.UTF-8")] {
+            if !env.iter().any(|(k, _)| k == key) {
+                env_strings.push(format!("{key}={val}"));
+            }
+        }
         env_strings.extend(env.iter().map(|(k, v)| format!("{}={}", k, v)));
 
         // Capabilities. Default is VM-grade (full set): the microVM is the security
@@ -535,10 +542,14 @@ impl OciSpec {
                 env: env_strings,
                 cwd: workdir.to_string(),
                 capabilities: Some(capabilities),
+                // 1024 is far too low for process-heavy server test suites (Puma
+                // etc. hit EMFILE); a generous soft default with a high hard cap
+                // lets tests raise further. CAP_SYS_RESOURCE (VM-grade caps) is
+                // present, so crun can apply the high hard limit.
                 rlimits: Some(vec![OciRlimit {
                     rlimit_type: "RLIMIT_NOFILE".to_string(),
-                    hard: 1024,
-                    soft: 1024,
+                    hard: 1_048_576,
+                    soft: 16384,
                 }]),
                 no_new_privileges: false,
             },

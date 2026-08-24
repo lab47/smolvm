@@ -33,7 +33,7 @@ const steps: [string, string, number][] = [
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y --no-install-recommends \
-  ca-certificates curl git unzip xz-utils build-essential pkg-config \
+  ca-certificates curl git unzip xz-utils file build-essential g++ pkg-config \
   autoconf bison libssl-dev libyaml-dev libreadline-dev zlib1g-dev \
   libncurses-dev libffi-dev libgdbm-dev libgmp-dev libdb-dev uuid-dev
 echo apt-done`,

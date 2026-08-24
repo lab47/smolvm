@@ -16,19 +16,24 @@ use crate::paths;
 pub const DEFAULT_CONTAINER_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Ensure PATH is included in environment variables for crun exec.
+/// Ensure sensible default env vars for `crun exec` that the caller can override.
 ///
-/// When crun exec is called with `--env`, it doesn't search PATH for executables
-/// unless PATH is explicitly set. This function ensures PATH is always present.
+/// crun exec with `--env` replaces the environment, so it drops the container's
+/// PATH (breaking bare-name lookup) and any locale. Default PATH plus a UTF-8
+/// locale (so tools don't hit "invalid byte sequence in US-ASCII"), each only
+/// when the caller hasn't set it.
 fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
-    let has_path = env.iter().any(|(k, _)| k == "PATH");
-    if has_path {
-        env.to_vec()
-    } else {
-        let mut result = env.to_vec();
-        result.push(("PATH".to_string(), DEFAULT_CONTAINER_PATH.to_string()));
-        result
+    let mut result = env.to_vec();
+    for (key, val) in [
+        ("PATH", DEFAULT_CONTAINER_PATH),
+        ("LANG", "C.UTF-8"),
+        ("LC_ALL", "C.UTF-8"),
+    ] {
+        if !env.iter().any(|(k, _)| k == key) {
+            result.push((key.to_string(), val.to_string()));
+        }
     }
+    result
 }
 
 /// Builder for crun commands with consistent configuration.
