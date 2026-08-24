@@ -51,6 +51,11 @@ export class WsConn {
     this.sendFrame(OP_TEXT, Buffer.from(s, "utf8"));
   }
 
+  /** Send a ping frame (keepalive). The peer is expected to pong. */
+  ping(payload: Buffer = Buffer.alloc(0)): void {
+    this.sendFrame(OP_PING, payload);
+  }
+
   close(code = 1000): void {
     if (this.closed) return;
     const b = Buffer.alloc(2);

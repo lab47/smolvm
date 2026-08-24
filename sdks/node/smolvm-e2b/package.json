@@ -29,7 +29,8 @@
     "example:basic": "../node_modules/.bin/tsx examples/basic.ts",
     "example:ifconfig": "../node_modules/.bin/tsx examples/ifconfig.ts",
     "example:preview": "../node_modules/.bin/tsx examples/remote-preview.ts",
-    "example:build-template": "../node_modules/.bin/tsx examples/build-template.ts"
+    "example:build-template": "../node_modules/.bin/tsx examples/build-template.ts",
+    "example:shell": "../node_modules/.bin/tsx examples/shell.ts"
   },
   "engines": {
     "node": ">= 18.0.0"

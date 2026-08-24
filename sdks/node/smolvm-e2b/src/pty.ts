@@ -45,24 +45,39 @@ export class Pty {
     const exited = new Promise<number>((r) => {
       resolveExit = r;
     });
+
+    // Keepalive. An idle PTY (no input or output) sends no frames, so a
+    // network-path idle timeout — QUIC/TLS/proxy between the client and the
+    // sandbox — drops the session after ~20-30s. A periodic ping is invisible to
+    // the remote shell and resets every hop's idle timer; the server auto-pongs.
+    const keepalive = setInterval(() => ws.ping(), 10_000);
+    keepalive.unref?.();
+    const finish = (code: number) => {
+      clearInterval(keepalive);
+      resolveExit(code);
+    };
+
     ws.on({
       onBinary: (d) => opts.onData?.(d),
       onText: (t) => {
         try {
           const m = JSON.parse(t) as { type?: string; code?: number };
-          if (m.type === "exit") resolveExit(m.code ?? 0);
+          if (m.type === "exit") finish(m.code ?? 0);
         } catch {
           /* non-JSON text is not expected on this stream; ignore */
         }
       },
-      onClose: () => resolveExit(130),
+      onClose: () => finish(130),
     });
 
     return {
       sendStdin: (data) =>
         ws.sendBinary(typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data)),
       resize: (cols, rows) => ws.sendText(JSON.stringify({ type: "resize", cols, rows })),
-      kill: () => ws.close(),
+      kill: () => {
+        clearInterval(keepalive);
+        ws.close();
+      },
       exited,
     };
   }

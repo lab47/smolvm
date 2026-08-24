@@ -110,7 +110,11 @@ export class Sandbox {
     // an OCI image, else "alpine") and auto-starts — no client-side resolve/start.
     const body: Record<string, unknown> = {
       templateID: opts.template,
-      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
+      // Send the timeout whenever the caller set one — including 0. The server
+      // reads timeout=0 as "no idle deadline"; omitting the field lets it fall
+      // back to its 15s default (which would pause the sandbox mid-session). Use
+      // `!== undefined` so an explicit `timeoutMs: 0` is sent, not dropped as falsy.
+      timeout: opts.timeoutMs !== undefined ? Math.ceil(opts.timeoutMs / 1000) : undefined,
       metadata: opts.metadata,
       envVars: opts.envs,
       allow_internet_access: opts.network,
