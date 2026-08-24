@@ -48,12 +48,20 @@ export interface SandboxOpts extends ConnectionOpts {
    * `$SMOLVM_PREVIEW_DOMAIN` or `"localhost"`.
    */
   previewDomain?: string;
+  /**
+   * Port to append to {@link Sandbox.getHost} URLs when the proxy listens on a
+   * non-standard port (anything but 80/443) — e.g. `8080` yields
+   * `<port>-<id>.<previewDomain>:8080`. Defaults to `$SMOLVM_PREVIEW_PORT`.
+   */
+  previewPort?: number;
 }
 
 /** Options for reconnecting to a running sandbox. */
 export interface ConnectOpts extends ConnectionOpts {
   /** Base domain for `getHost` URLs (see {@link SandboxOpts.previewDomain}). */
   previewDomain?: string;
+  /** Non-standard proxy port for `getHost` URLs (see {@link SandboxOpts.previewPort}). */
+  previewPort?: number;
 }
 
 /** Options for resuming a paused sandbox. */
@@ -62,6 +70,8 @@ export interface ResumeOpts extends ConnectionOpts {
   timeoutMs?: number;
   /** Base domain for `getHost` URLs (see {@link SandboxOpts.previewDomain}). */
   previewDomain?: string;
+  /** Non-standard proxy port for `getHost` URLs (see {@link SandboxOpts.previewPort}). */
+  previewPort?: number;
 }
 
 /** Result of a completed command. */

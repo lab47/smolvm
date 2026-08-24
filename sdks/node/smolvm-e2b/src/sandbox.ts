@@ -70,25 +70,37 @@ export class Sandbox {
 
   private client: Client;
   private previewDomain: string;
+  private previewPort?: number;
 
-  private constructor(sandboxId: string, client: Client, previewDomain?: string) {
+  private constructor(
+    sandboxId: string,
+    client: Client,
+    previewDomain?: string,
+    previewPort?: number,
+  ) {
     this.sandboxId = sandboxId;
     this.client = client;
     this.previewDomain =
       previewDomain ?? process.env.SMOLVM_PREVIEW_DOMAIN ?? "localhost";
+    this.previewPort =
+      previewPort ??
+      (process.env.SMOLVM_PREVIEW_PORT ? Number(process.env.SMOLVM_PREVIEW_PORT) : undefined);
     this.commands = new Commands(client, sandboxId);
     this.files = new Files(client, this.commands, sandboxId);
     this.pty = new Pty(client, sandboxId);
   }
 
   /**
-   * Hostname to reach a service running inside the sandbox on `port`, through the
-   * preview proxy — `<port>-<sandboxId>.<previewDomain>`. Prefix with `http://`
-   * or `https://` to form a URL. The port must have been declared in
+   * Hostname (authority) to reach a service running inside the sandbox on `port`,
+   * through the preview proxy — `<port>-<sandboxId>.<previewDomain>`, with
+   * `:previewPort` appended when the proxy is on a non-standard port. Prefix with
+   * `http://` or `https://` to form a URL. The port must have been declared in
    * `Sandbox.create({ ports })`. Mirrors e2b's `getHost`.
    */
   getHost(port: number): string {
-    return `${port}-${this.sandboxId}.${this.previewDomain}`;
+    const host = `${port}-${this.sandboxId}.${this.previewDomain}`;
+    const p = this.previewPort;
+    return p && p !== 80 && p !== 443 ? `${host}:${p}` : host;
   }
 
   /** Create and start a new sandbox. */
@@ -117,7 +129,7 @@ export class Sandbox {
       json: body,
       timeoutMs: 300_000,
     });
-    return new Sandbox(created.sandboxID, client, opts.previewDomain);
+    return new Sandbox(created.sandboxID, client, opts.previewDomain, opts.previewPort);
   }
 
   /** Reconnect to an already-running sandbox by id (no state change). */
@@ -125,7 +137,7 @@ export class Sandbox {
     const client = new Client(opts);
     // Verify it exists (throws NotFoundError otherwise).
     await client.requestJson<SandboxJson>("GET", `${sandboxesBase}/${id(sandboxId)}`);
-    return new Sandbox(sandboxId, client, opts.previewDomain);
+    return new Sandbox(sandboxId, client, opts.previewDomain, opts.previewPort);
   }
 
   /** Resume a paused sandbox, restoring its running processes. */
@@ -139,7 +151,7 @@ export class Sandbox {
       `${sandboxesBase}/${id(sandboxId)}/resume`,
       { json: body, timeoutMs: 300_000 },
     );
-    return new Sandbox(sandboxId, client, opts.previewDomain);
+    return new Sandbox(sandboxId, client, opts.previewDomain, opts.previewPort);
   }
 
   /** List sandboxes known to the control plane, optionally filtered by metadata. */

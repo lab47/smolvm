@@ -101,9 +101,18 @@ pub async fn require_api_key(
 // ---- helpers ----
 
 fn domain() -> Option<String> {
-    std::env::var("SMOLVM_PREVIEW_DOMAIN")
+    let base = std::env::var("SMOLVM_PREVIEW_DOMAIN")
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty())?;
+    // Append a non-standard preview-proxy port (anything but 80/443) so the
+    // reported preview base matches where the proxy actually listens.
+    match std::env::var("SMOLVM_PREVIEW_PORT")
+        .ok()
+        .filter(|p| !p.is_empty() && p != "80" && p != "443")
+    {
+        Some(port) => Some(format!("{base}:{port}")),
+        None => Some(base),
+    }
 }
 
 fn rfc3339(secs: u64) -> Option<String> {
