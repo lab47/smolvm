@@ -96,11 +96,26 @@ $RBENV_ROOT/shims/ruby --version && $RBENV_ROOT/shims/gem --version`,
     35 * MIN,
   ],
   [
-    "cleanup + verify",
+    "expose toolchains on the default (non-login) PATH",
+    // /etc/profile.d only helps login shells, but commands.run uses `sh -c`.
+    // Symlink every toolchain into /usr/local/bin (on the default PATH) so
+    // `ruby`/`go`/`node`/... work without a login shell. Rust: the real
+    // toolchain binaries, not the rustup proxies (proxies need RUSTUP_HOME).
+    String.raw`set -e
+for b in /usr/local/go/bin/* /opt/node/bin/* /opt/rbenv/shims/*; do ln -sf "$b" /usr/local/bin/; done
+ln -sf /opt/bun/bin/bun /usr/local/bin/bun
+ln -sf /opt/rbenv/bin/rbenv /usr/local/bin/rbenv
+RUST_TC=$(ls -d /opt/rust/toolchains/*/bin | head -1)
+for b in "$RUST_TC"/*; do ln -sf "$b" /usr/local/bin/; done
+echo "symlinked $(ls /usr/local/bin | wc -l) tools"`,
+    2 * MIN,
+  ],
+  [
+    "cleanup + verify (plain sh -c)",
     String.raw`set -e
 apt-get clean && rm -rf /var/lib/apt/lists/*
-echo '=== installed toolchain (login shell) ==='
-bash -lc 'go version; rustc --version; node --version; npm --version; bun --version; ruby --version; rbenv --version'`,
+echo '=== toolchain on the default PATH ==='
+sh -c 'go version; rustc --version; cargo --version; node --version; npm --version; bun --version; ruby --version; gem --version; rbenv --version'`,
     3 * MIN,
   ],
 ];
