@@ -118,7 +118,13 @@ pub fn collect_from_vm_assets(
     let mut image_env: Vec<String> = Vec::new();
 
     if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(collector, vm_name, &vm_dir, staging_dir)?;
+        export_flattened_from_artifact_sourced(
+            collector,
+            vm_name,
+            &vm_dir,
+            staging_dir,
+            vm.source_smolmachine.as_deref(),
+        )?;
     } else if is_image_based {
         let image = vm.image.clone().unwrap();
         // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
@@ -127,19 +133,15 @@ pub fn collect_from_vm_assets(
         // message instead of a confusing registry "UNAUTHORIZED" on
         // `local:<hash>`.
         if crate::data::image_source::is_local_ref(&image) {
-            return Err(Error::agent(
-                "pack from VM",
-                format!(
-                    "VM '{vm_name}' was created from a local image ({image}). \
-                     `pack create --from-vm` can only snapshot VMs created from a \
-                     REGISTRY image — local archives and rootfs directories are \
-                     flattened on boot and have no registry manifest to re-pull. \
-                     Recreate the machine from a registry reference to pack it."
-                ),
-            ));
+            // No registry manifest to re-pull, but the base rootfs is still
+            // reachable: an archive was flattened onto the machine's own storage
+            // disk at boot, and a rootfs dir is still the host directory the
+            // machine boots from. Either can be the lower layer.
+            export_flattened_from_local_image(collector, vm_name, &vm_dir, &image)?;
+        } else {
+            image_env =
+                export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
         }
-        image_env =
-            export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
     } else {
         // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
         // from the template; a default-size overlay is a qcow2 CoW image and
@@ -398,22 +400,171 @@ fn export_flattened_from_registry_image(
 /// machine layers cache; share them into the helper VM, stage them onto its
 /// local disk (overlayfs cannot use virtiofs-backed lowers), and flatten with
 /// the current container overlay.
+/// Export a machine created from a local image (`--image ./x.tar`, `--image -`,
+/// or `--image ./rootfs/`).
+///
+/// There is no registry manifest to re-pull, but the base rootfs is still
+/// available in one of two places depending on how it was supplied:
+///
+/// - **archive** (`local:<hash>`): flattened onto the machine's own storage disk
+///   at boot, under `image-archives/<key>/0000_rootfs`. The helper already
+///   mounts that disk read-only, so the layer is read straight from it.
+/// - **rootfs dir** (`local-dir:<path>`): never copied into the machine at all —
+///   the guest boots from the host directory over virtiofs, so the export shares
+///   that same directory into the helper.
+///
+/// Either way the machine's persistent container overlay goes on top, exactly as
+/// the registry and artifact paths do, so the packed result is the machine as it
+/// actually is rather than as it was first created.
+fn export_flattened_from_local_image(
+    collector: &mut AssetCollector,
+    vm_name: &str,
+    vm_dir: &Path,
+    image: &str,
+) -> crate::Result<()> {
+    let host_dir = crate::data::image_source::packed_layers_dir_for_ref(image);
+    let is_dir_source = image.starts_with("local-dir:");
+
+    // A rootfs dir is the only source of its own base layer: if the host
+    // directory is gone, nothing on the machine can stand in for it.
+    if is_dir_source {
+        match host_dir.as_deref() {
+            Some(dir) if dir.is_dir() => {}
+            _ => {
+                return Err(Error::agent(
+                    "pack from VM",
+                    format!(
+                        "machine '{vm_name}' was created from the rootfs directory {image}, \
+                         but that directory is no longer present. The machine boots its base \
+                         layer from there, so it has to exist to export. Restore it, or \
+                         recreate the machine from an image that carries its own layers."
+                    ),
+                ));
+            }
+        }
+    }
+
+    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false)?;
+    let mut client = export_vm.connect()?;
+    export_vm.mount_source_storage(&mut client)?;
+
+    // Stage the base layer onto the helper's own disk through tar, so whiteout
+    // devices and opaque-dir xattrs survive into the overlay mount below.
+    let src = if is_dir_source {
+        "/packed_layers".to_string()
+    } else {
+        locate_flattened_archive_rootfs(&mut client, vm_name)?
+    };
+    println!("Staging the machine's base layer for flatten...");
+    let dst = "/storage/stage/0".to_string();
+    let stage_cmd =
+        format!("mkdir -p '{dst}' && (cd '{src}' && tar cf - .) | (cd '{dst}' && tar xf -)");
+    let (exit_code, _, stderr) = client.vm_exec(
+        vec!["sh".to_string(), "-c".to_string(), stage_cmd],
+        vec![],
+        None,
+        None,
+        None,
+    )?;
+    if exit_code != 0 {
+        return Err(Error::agent(
+            "stage local base layer",
+            format!(
+                "staging {src} failed (exit {}): {}",
+                exit_code,
+                String::from_utf8_lossy(&stderr)
+            ),
+        ));
+    }
+
+    flatten_and_export(collector, &mut client, vm_name, &[dst])
+}
+
+/// The flattened rootfs of a local *archive* image on the source machine's
+/// storage disk, as a helper-local path.
+///
+/// The directory is keyed by a content hash the exporter does not have, so it is
+/// discovered rather than computed; a machine boots exactly one local archive,
+/// so a single match is expected.
+fn locate_flattened_archive_rootfs(
+    client: &mut AgentClient,
+    vm_name: &str,
+) -> crate::Result<String> {
+    let (exit_code, stdout, _) = client.vm_exec(
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "ls -d /mnt/source-storage/image-archives/*/0000_rootfs 2>/dev/null".to_string(),
+        ],
+        vec![],
+        None,
+        None,
+        None,
+    )?;
+    let found: Vec<String> = String::from_utf8_lossy(&stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    match found.as_slice() {
+        [one] if exit_code == 0 => Ok(one.clone()),
+        [] => Err(Error::agent(
+            "pack from VM",
+            format!(
+                "machine '{vm_name}' was created from a local image archive, but no flattened \
+                 rootfs was found on its storage disk. The archive is flattened on first boot — \
+                 start the machine once, then re-run the export."
+            ),
+        )),
+        many => Err(Error::agent(
+            "pack from VM",
+            format!(
+                "machine '{vm_name}' has {} flattened image archives on its storage disk, so \
+                 the base layer is ambiguous. Recreate the machine from a single image and \
+                 export that.",
+                many.len()
+            ),
+        )),
+    }
+}
+
 fn export_flattened_from_artifact_sourced(
     collector: &mut AssetCollector,
     vm_name: &str,
     vm_dir: &Path,
     _staging_dir: &Path,
+    source_smolmachine: Option<&str>,
 ) -> crate::Result<()> {
     let cache_dir = machine_layers_cache_dir(vm_name);
-    let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
-    let layer_ids = ordered_cached_layer_ids(&pack_content_dir).ok_or_else(|| {
+    let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
+    let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+    // Self-heal a missing or damaged layer cache from the machine's source
+    // artifact (a cache cleaner can delete the layer files while leaving the
+    // extraction marker, in which case a start does NOT re-extract either —
+    // the old "start the machine once" advice was a dead end there). Only the
+    // per-machine cache is healed here; a shared-store entry heals at boot.
+    if layer_ids.is_none() && pack_content_dir == cache_dir {
+        if let Some(sidecar) = source_smolmachine.map(Path::new).filter(|s| s.exists()) {
+            eprintln!("Imported layer cache is missing; re-extracting from the source artifact...");
+            let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+                .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, true, false)
+                .map_err(|e| Error::agent("re-extract source artifact", e.to_string()))?;
+            layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+        }
+    }
+    let layer_ids = layer_ids.ok_or_else(|| {
         Error::agent(
             "pack from VM",
             format!(
                 "VM '{vm_name}' was created from a .smolmachine artifact, but its \
-                 imported layer cache is missing ({}). Start the machine once to \
-                 re-extract it, then re-run the export.",
-                pack_content_dir.display()
+                 imported layer cache is missing ({}) and could not be rebuilt: \
+                 the source artifact ({}) is not available. Restore the source \
+                 .smolmachine at that path, or start the machine once to \
+                 re-extract, then re-run the export.",
+                pack_content_dir.display(),
+                source_smolmachine.unwrap_or("unknown path"),
             ),
         )
     })?;

@@ -57,20 +57,30 @@ pub fn launch_image_workload(
     exec_env: Vec<(String, String)>,
 ) -> crate::Result<bool> {
     let Some(ref image) = record.image else {
+        // Remote volumes mount inside a workload container, which a machine with
+        // no image never launches — honoring the volume is impossible. Fail
+        // loudly instead of silently dropping it.
+        if !record.remote_volumes.is_empty() {
+            return Err(crate::Error::agent(
+                "launch workload",
+                "remote volumes require an image-backed machine — there is no \
+                 workload container to mount into",
+            ));
+        }
         return Ok(false);
     };
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
+    // Remote volumes are mounted by the agent itself, natively, between the
+    // container's create and start — so the workload sees its data from its
+    // first instruction and its command is never rewritten.
     match client.run_container_detached(
         RunConfig::new(image, command)
-            .with_env(exec_env)
             .with_workdir(record.workdir.clone())
             .with_user(record.user.clone())
             .with_mounts(record_mounts_to_bindings(&record.mounts))
-            .with_persistent_overlay(Some(persistent_overlay_owner(
-                machine_name,
-                record.golden.as_deref(),
-            ))),
+            .in_machine(record, machine_name, &exec_env)
+            .with_env(exec_env),
     ) {
         Ok(_) => Ok(true),
         Err(e) if is_missing_launch_metadata(&e.to_string()) => {

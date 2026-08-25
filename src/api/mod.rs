@@ -159,6 +159,7 @@ use state::ApiState;
         // Response types
         types::HealthResponse,
         types::CapacityResponse,
+        types::CudaDeviceCapacity,
         types::MachineInfo,
         types::EgressDenialInfo,
         types::EgressEventsResponse,

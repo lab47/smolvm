@@ -139,27 +139,39 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
+/// Build the clone-local release and acknowledgement script.
+fn build_release_forkpoint_script() -> String {
+    format!(
+        "set -e; mkdir -p '{dir}'; umask 077; printf '%s\\n' smolvm-forkpoint-release-v1 > '{release}.tmp'; mv '{release}.tmp' '{release}'; \
+         i=0; while [ -f '{ready}' ]; do i=$((i + 1)); [ \"$i\" -lt 500 ] || exit 46; sleep 0.02; done",
+        dir = smolvm_protocol::forkpoint::STATE_DIR,
+        release = smolvm_protocol::forkpoint::RELEASE_PATH,
+        ready = smolvm_protocol::forkpoint::READY_PATH,
+    )
+}
+
 /// Release the workload restored in `clone` after its identity and per-fork
 /// environment are installed. The state directory is private guest RAM, so a
 /// release marker wakes only this clone even though every clone inherited the
-/// same blocked helper process.
+/// same blocked helper process. Success means the helper also acknowledged the
+/// marker and left the fork boundary; callers may safely vend the clone.
 pub fn release_forkpoint(clone: &str) -> Result<()> {
     let socket = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("release forkpoint", format!("agent connect: {e}")))?;
-    let script = format!(
-        "set -e; mkdir -p '{dir}'; umask 077; printf '%s\\n' smolvm-forkpoint-release-v1 > '{release}.tmp'; mv '{release}.tmp' '{release}'",
-        dir = smolvm_protocol::forkpoint::STATE_DIR,
-        release = smolvm_protocol::forkpoint::RELEASE_PATH,
-    );
+    let script = build_release_forkpoint_script();
     match client.vm_exec(
         vec!["/bin/sh".into(), "-c".into(), script],
         vec![],
         None,
-        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(15)),
         None,
     ) {
         Ok((0, _, _)) => Ok(()),
+        Ok((46, _, _)) => Err(Error::agent(
+            "release forkpoint",
+            format!("clone '{clone}' did not acknowledge its release marker"),
+        )),
         Ok((code, _, stderr)) => Err(Error::agent(
             "release forkpoint",
             format!(
@@ -483,7 +495,11 @@ pub(crate) fn prepare_forks_reusing(
             .map_err(|e| Error::agent("create snapshot root", e.to_string()))?;
         let snapshot_dir = (0..128)
             .find_map(|_| {
-                let candidate = snapshot_root.join(host_random_hex(8));
+                let suffix = match host_random_hex(8) {
+                    Ok(suffix) => suffix,
+                    Err(error) => return Some(Err(std::io::Error::other(error.to_string()))),
+                };
+                let candidate = snapshot_root.join(suffix);
                 match std::fs::create_dir(&candidate) {
                     Ok(()) => Some(Ok(candidate)),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
@@ -928,17 +944,51 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
     // `merged` mount, exactly as [`write_fork_env`] does and for the same
     // reason: a container exec would recycle the workload the fork just
     // restored. A bare VM (no image) keeps the plain VM-rootfs paths.
-    let (root, require_root) = match record.image {
+    let (root, require_root, runtime_hostname, restored_container) = match record.image {
         Some(_) => {
             let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
             let merged = format!("/storage/overlays/persistent-{owner}/merged");
+            let container_id = format!("/storage/overlays/persistent-{owner}/main_container_id");
             let require = format!(
                 "if [ ! -d {merged} ]; then echo \"missing {merged}; overlays:\" >&2; \
                  ls /storage/overlays >&2; exit 41; fi; "
             );
-            (merged, require)
+            // A restored keep-alive container has its own UTS namespace. The
+            // plain `hostname` call below updates the VM/agent namespace, but
+            // not that inherited namespace, so `hostname(2)` inside the clone
+            // otherwise keeps reporting the golden's name. Enter only the
+            // live container's UTS namespace and update it in place: no process
+            // restart, heap loss, or overlay remount. A missing/stale crun state
+            // is harmless because the next exec will rebuild the container; its
+            // OCI spec reads the rejuvenated VM hostname (see `container_hostname`).
+            let runtime_hostname = format!(
+                "if [ -s '{container_id}' ]; then \
+                     CID=$(cat '{container_id}'); \
+                     PID=$(/usr/bin/crun --root /storage/containers/crun \
+                         --cgroup-manager disabled state \"$CID\" 2>/dev/null \
+                         | /usr/bin/jq -r '.pid // empty' 2>/dev/null || true); \
+                     case \"$PID\" in \
+                       ''|*[!0-9]*) ;; \
+                       *) if [ -e \"/proc/$PID/ns/uts\" ]; then \
+                            /usr/bin/nsenter --uts=\"/proc/$PID/ns/uts\" \
+                                /bin/hostname '{clone}'; \
+                          fi ;; \
+                     esac; \
+                 fi; "
+            );
+            let restored_container = format!(
+                "mkdir -p '{state_dir}'; \
+                 if [ -s '{container_id}' ]; then \
+                     cat '{container_id}' > '{restored_container_path}'; \
+                 else \
+                     rm -f '{restored_container_path}'; \
+                 fi; ",
+                restored_container_path = smolvm_protocol::forkpoint::RESTORED_CONTAINER_PATH,
+                state_dir = smolvm_protocol::forkpoint::STATE_DIR,
+            );
+            (merged, require, runtime_hostname, restored_container)
         }
-        None => (String::new(), String::new()),
+        None => (String::new(), String::new(), String::new(), String::new()),
     };
     // `ssh-keygen -A` writes to a hardcoded /etc/ssh, so regenerating the
     // container's keys means running the container's own binary under chroot.
@@ -1001,20 +1051,25 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
         "set -e; \
          {require_root}\
          hostname '{c}' 2>/dev/null || true; \
+         {runtime_hostname}\
+         {restored_container}\
+         printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
+         MID=$(printf '%.32s' '{s}'); \
          printf '%s\\n' '{c}' > {root}/etc/hostname; \
-         tr -d '-' < /proc/sys/kernel/random/uuid > {root}/etc/machine-id; \
+         printf '%s\\n' \"$MID\" > {root}/etc/machine-id; \
          if [ -f {root}/var/lib/dbus/machine-id ] && [ ! -L {root}/var/lib/dbus/machine-id ]; then \
-             tr -d '-' < /proc/sys/kernel/random/uuid > {root}/var/lib/dbus/machine-id; \
+             printf '%s\\n' \"$MID\" > {root}/var/lib/dbus/machine-id; \
          fi; \
          {ssh_block}; \
          rm -rf {root}/var/lib/cloud/instance {root}/var/lib/cloud/instances/* {root}/var/lib/cloud/data/instance-id 2>/dev/null || true; \
-         printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
          umask 077; \
          mkdir -p '{state_dir}'; \
          printf '%s\n' smolvm-forkpoint-restored-v1 > '{restored}'; \
          true",
         c = clone,
         s = seed,
+        runtime_hostname = runtime_hostname,
+        restored_container = restored_container,
         state_dir = smolvm_protocol::forkpoint::STATE_DIR,
         restored = smolvm_protocol::forkpoint::RESTORED_PATH,
     )
@@ -1047,7 +1102,7 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
 /// (MAC/IP; safe under the default TSI backend) — both are follow-ups.
 pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
     let sock = vm_data_dir(clone).join("agent.sock");
-    let seed = host_random_hex(64);
+    let seed = host_random_hex(64)?;
     let script = build_rejuvenation_script(clone, &seed, record);
 
     let mut last_err = String::from("unknown error");
@@ -1530,13 +1585,21 @@ fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
 
 /// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed
 /// each clone's RNG with distinct host entropy.
-fn host_random_hex(hex_len: usize) -> String {
+fn host_random_hex(hex_len: usize) -> Result<String> {
     use std::io::Read;
-    let mut buf = vec![0u8; hex_len / 2];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
+    if hex_len == 0 || !hex_len.is_multiple_of(2) {
+        return Err(Error::agent(
+            "seed clone identity",
+            "random hex length must be a non-zero even number",
+        ));
     }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    let mut buf = vec![0u8; hex_len / 2];
+    let mut random = std::fs::File::open("/dev/urandom")
+        .map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
+    random
+        .read_exact(&mut buf)
+        .map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -1578,6 +1641,19 @@ mod tests {
         assert!(fork_base_already_paused("OK paused\n"));
         assert!(!fork_base_already_paused("OK running\n"));
         assert!(!fork_base_already_paused("ERR not forkable\n"));
+    }
+
+    #[test]
+    fn forkpoint_release_waits_for_clone_acknowledgement() {
+        let script = build_release_forkpoint_script();
+        let publish = script
+            .find(smolvm_protocol::forkpoint::RELEASE_PATH)
+            .expect("release marker must be published");
+        let acknowledge = script
+            .rfind(smolvm_protocol::forkpoint::READY_PATH)
+            .expect("ready marker must be observed");
+        assert!(publish < acknowledge);
+        assert!(script.contains("exit 46"));
     }
 
     #[test]
@@ -1948,6 +2024,11 @@ mod tests {
         assert!(script.contains("> /etc/machine-id"));
         assert!(script.contains("> /etc/hostname"));
         assert!(script.contains("/var/lib/dbus/machine-id"));
+        assert!(script.contains("MID=$(printf '%.32s' 'deadbeef')"));
+        assert!(
+            script.find("> /dev/urandom").unwrap() < script.find(r#""$KG" -A"#).unwrap(),
+            "host entropy must be mixed before SSH keys are generated: {script}"
+        );
         // The clone name and RNG seed are threaded through.
         assert!(script.contains("clone-a"));
         assert!(script.contains("deadbeef"));
@@ -2016,6 +2097,14 @@ mod tests {
             "keys must be regenerated by the container's own binary: {script}"
         );
         assert!(script.contains("/usr/sbin/chroot"));
+        // The inherited container has a private UTS namespace. Update it in
+        // place so gethostname()/`hostname` agree with the on-disk identity
+        // without restarting the warm workload.
+        assert!(script.contains("main_container_id"));
+        assert!(script.contains(smolvm_protocol::forkpoint::RESTORED_CONTAINER_PATH));
+        assert!(script.contains("--root /storage/containers/crun"));
+        assert!(script.contains("/usr/bin/nsenter --uts="));
+        assert!(script.contains("/bin/hostname 'clone-a'"));
         // Fail-closed: a missing overlay, or keys that could not be regenerated,
         // must abort rather than vend a clone on the golden's identity.
         assert!(
@@ -2037,6 +2126,15 @@ mod tests {
         assert!(script.contains(r#""$KG" -A"#));
         // No chroot on the bare-VM path: the VM rootfs is the workload's rootfs.
         assert!(!script.contains("chroot"));
+    }
+
+    #[test]
+    fn clone_identity_seed_is_exact_and_never_silently_zero_filled() {
+        let seed = host_random_hex(64).expect("host RNG must be available");
+        assert_eq!(seed.len(), 64);
+        assert!(seed.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(host_random_hex(0).is_err());
+        assert!(host_random_hex(3).is_err());
     }
 
     // Fix 2 (fail-closed): an Err rejuvenation must tear the clone down and

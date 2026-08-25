@@ -586,11 +586,26 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     validate_vm_name(&params.name, "machine name")
         .map_err(|reason| smolvm::Error::config("create machine", reason))?;
 
+    // Peel off remote volume specs (`s3://`) before the host-directory parse;
+    // they mount inside the guest at start instead of through virtiofs.
+    let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
+
     // Parse and validate volume mounts
-    let mounts = HostMount::parse(&params.volume)?
+    let mounts: Vec<(String, String, bool)> = HostMount::parse(&host_volume_specs)?
         .into_iter()
         .map(|m| m.to_storage_tuple())
         .collect();
+    for volume in &remote_volumes {
+        if mounts.iter().any(|(_, target, _)| target == &volume.target) {
+            return Err(smolvm::Error::config(
+                "create machine",
+                format!(
+                    "duplicate mount target: {} is specified more than once",
+                    volume.target
+                ),
+            ));
+        }
+    }
 
     // Convert port mappings to tuple format for storage
     let ports = PortMapping::to_tuples(&params.port);
@@ -653,6 +668,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         restart,
     );
     record.init = params.init.clone();
+    record.remote_volumes = remote_volumes;
     record.env = env;
     record.secret_refs = params.secret_refs.clone();
     record.workdir = params.workdir.clone();
@@ -691,6 +707,11 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     // A registry image with no network can never be pulled (the guest runs the
     // pull), so refuse here rather than deferring to a `start` that must fail.
     record.validate_image_fetchable()?;
+
+    // Remote volumes mount into the workload container's namespace, so an
+    // imageless machine has nowhere to put them, and they need network to
+    // reach the bucket. Refuse at create instead of failing every start.
+    record.validate_remote_volumes()?;
 
     Ok(record)
 }
@@ -780,6 +801,21 @@ pub struct ForkVmOptions<'a> {
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
+    // A live FUSE mount does not survive the freeze/restore: the restored
+    // clone's mount wedges its container namespace and every exec hangs.
+    // Refuse cleanly until fork remounts remote volumes on restore.
+    if let Some(record) = db.get_vm(golden)? {
+        if !record.remote_volumes.is_empty() {
+            return Err(smolvm::Error::config(
+                "machine fork",
+                format!(
+                    "machine '{golden}' has remote volumes, which cannot be forked yet: \
+                     a mounted remote filesystem does not survive the freeze/restore"
+                ),
+            ));
+        }
+    }
+
     if let Some(timeout) = options.wait_ready {
         eprintln!("Waiting for golden '{golden}' to reach its forkpoint...");
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
@@ -866,6 +902,22 @@ pub fn fork_vm_batch(
     hold: bool,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
+
+    // A live FUSE mount does not survive the freeze/restore: the restored
+    // clone's mount wedges its container namespace and every exec hangs.
+    // Refuse cleanly until fork remounts remote volumes on restore.
+    if let Some(record) = db.get_vm(golden)? {
+        if !record.remote_volumes.is_empty() {
+            return Err(smolvm::Error::config(
+                "machine fork",
+                format!(
+                    "machine '{golden}' has remote volumes, which cannot be forked yet: \
+                     a mounted remote filesystem does not survive the freeze/restore"
+                ),
+            ));
+        }
+    }
+
     if let Some(timeout) = wait_ready {
         eprintln!("Waiting for golden '{golden}' to reach its forkpoint...");
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
@@ -1555,6 +1607,9 @@ fn start_vm_named_with_db(
         // entirely when restoring from a snapshot — the forked container is
         // inherited as-is.
         let _ = img;
+        // Remote volumes are mounted natively by the agent between the
+        // container's create and start, and a mount that never appears
+        // fails the start there — so no host-side preflight is needed.
         if !from_snapshot {
             if let Err(e) = smolvm::workload::launch_image_workload(
                 &mut client,

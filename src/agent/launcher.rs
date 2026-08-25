@@ -487,10 +487,14 @@ impl LaunchFeatures {
             return Ok(self);
         }
 
-        if !smolvm_pack::extract::is_extracted(layers_cache_dir) {
+        let marker_present = smolvm_pack::extract::is_extracted(layers_cache_dir);
+        if !marker_present || !smolvm_pack::extract::cached_layers_usable(layers_cache_dir) {
             // Fallback: layers not yet extracted into this machine's own dir
-            // (pre-this-layout machine, or an interrupted create). Extract from
-            // the source bundle, which must still be present in that case.
+            // (pre-this-layout machine, or an interrupted create), OR the
+            // extraction marker survived while the layer files themselves were
+            // deleted (cache cleaners take the large files and leave the tiny
+            // marker). Extract from the source bundle, which must still be
+            // present in that case; force past the marker when it lies.
             let sidecar = Path::new(sidecar_path);
             if !sidecar.exists() {
                 return Err(Error::agent(
@@ -503,10 +507,22 @@ impl LaunchFeatures {
                     ),
                 ));
             }
+            if marker_present {
+                tracing::info!(
+                    cache = %layers_cache_dir.display(),
+                    "layer cache marked extracted but unusable; re-extracting from the source bundle"
+                );
+            }
             let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
                 .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
-            smolvm_pack::extract::extract_sidecar(sidecar, layers_cache_dir, &footer, false, false)
-                .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(
+                sidecar,
+                layers_cache_dir,
+                &footer,
+                marker_present,
+                false,
+            )
+            .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
         }
 
         let layers_lease = smolvm_pack::extract::acquire_layers_lease(layers_cache_dir, false)
@@ -719,6 +735,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     })?;
     let krun =
         unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
+    if resources.gpu {
+        krun.ensure_gpu_runtime()
+            .map_err(|e| Error::agent("configure gpu", e))?;
+    }
     boot_timing!("dylib loaded");
 
     // Pre-read the agent binary into the OS page cache so the virtiofs thread
@@ -808,6 +828,107 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             }
             tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+
+            // Optional virtio-gpu scanout. Venus gives the guest GPU
+            // *rendering*; a scanout gives it a *display*. With no display the
+            // device reports num_scanouts = 0, the guest creates no connector,
+            // and card0 is a render node only — which is why DRM compositors
+            // (Hyprland, GNOME, KDE) refuse to start with "not a KMS device".
+            //
+            // Opt-in: a connector changes guest topology, and existing GPU
+            // workloads (CUDA, headless Vulkan) neither need nor want one.
+            if let Some((w, h)) =
+                super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
+            {
+                super::default_gpu_backend_for_display();
+                let add_display = match krun.add_display {
+                    Some(f) => f,
+                    None => {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure display",
+                            "SMOLVM_DISPLAY set but this libkrun has no krun_add_display",
+                        ));
+                    }
+                };
+                let ret = add_display(ctx, w, h);
+                if ret < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure display",
+                        format!("krun_add_display({w}x{h}) failed (ret={ret})"),
+                    ));
+                }
+                tracing::info!(
+                    width = w,
+                    height = h,
+                    display_id = ret,
+                    "virtio-gpu scanout added (guest gets a KMS connector)"
+                );
+
+                // A described display is not a usable one. Without a backend
+                // to consume frames libkrun installs a no-op that fails every
+                // scanout call, so the guest's first page flip never completes
+                // and the compositor blocks on it forever. Register the host
+                // framebuffer that actually takes the frames.
+                let set_backend = match krun.set_display_backend {
+                    Some(f) => f,
+                    None => {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure display",
+                            "SMOLVM_DISPLAY set but this libkrun has no \
+                             krun_set_display_backend; without it the guest \
+                             would hang on its first page flip",
+                        ));
+                    }
+                };
+                let framebuffer = match super::display::install(set_backend, ctx) {
+                    Ok(fb) => fb,
+                    Err(e) => {
+                        krun_free_ctx(ctx);
+                        return Err(e);
+                    }
+                };
+
+                // Serving RFB from the host means the guest needs no capture
+                // tool and no compositor-specific screencopy protocol.
+                if let Some(bind) = std::env::var("SMOLVM_VNC")
+                    .ok()
+                    .as_deref()
+                    .and_then(super::vnc::parse_bind_addr)
+                {
+                    // Input is best-effort: a libkrun without the input
+                    // feature (or an install failure) degrades the session to
+                    // view-only rather than blocking the display.
+                    let input = match krun.add_input_device {
+                        Some(add_input) => match super::input::install(add_input, ctx) {
+                            Ok(i) => {
+                                tracing::info!("vnc input devices attached (keyboard + pointer)");
+                                Some(i)
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "vnc input unavailable; view-only");
+                                None
+                            }
+                        },
+                        None => {
+                            tracing::info!(
+                                "libkrun has no krun_add_input_device; vnc is view-only"
+                            );
+                            None
+                        }
+                    };
+                    match super::vnc::serve(&bind, framebuffer, input) {
+                        Ok(addr) => tracing::info!(%addr, "vnc server listening"),
+                        Err(e) => {
+                            // A failed viewer must not take down the VM: the
+                            // display itself is already working without it.
+                            tracing::warn!(bind = %bind, error = %e, "vnc server failed to start");
+                        }
+                    }
+                }
+            }
         }
 
         // Helper: evaluate a fallible expression, freeing ctx if it fails.
@@ -2003,7 +2124,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         return None;
                     }
                     Some(
-                        buf.chunks_exact(3)
+                        buf.as_chunks::<3>()
+                            .0
+                            .iter()
                             .map(|c| (c[0], c[1], c[2]))
                             .collect::<Vec<_>>(),
                     )

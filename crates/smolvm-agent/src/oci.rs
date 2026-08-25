@@ -548,8 +548,8 @@ impl OciSpec {
                 // present, so crun can apply the high hard limit.
                 rlimits: Some(vec![OciRlimit {
                     rlimit_type: "RLIMIT_NOFILE".to_string(),
-                    hard: 1_048_576,
-                    soft: 16384,
+                    hard: crate::DEFAULT_NOFILE_LIMIT,
+                    soft: crate::DEFAULT_NOFILE_LIMIT,
                 }]),
                 no_new_privileges: false,
             },
@@ -1024,6 +1024,21 @@ fn default_devices() -> Vec<OciDevice> {
             uid: Some(0),
             gid: Some(0),
         },
+        // /dev/fuse - userspace filesystems. The guest kernel has FUSE, but the
+        // container /dev is built from this list, so without an entry here any
+        // FUSE client in the image (JuiceFS, s3fs, SeaweedFS, sshfs) fails to
+        // mount until the user runs `mknod /dev/fuse c 10 229` by hand. The
+        // agent's own remote-volume mounts create the node themselves; this
+        // makes a client the user brings work the same way.
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/fuse".to_string(),
+            major: 10,
+            minor: 229,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
     ]
 }
 
@@ -1175,19 +1190,37 @@ fn proc_filesystems_has(fstype: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// The container's hostname: the machine's name when the host supplied one
-/// out of the box. The name is validated as a lowercase DNS label at machine
-/// creation (see `validate_vm_name`), so it is a valid hostname verbatim — the
-/// name primary key's uniqueness carries straight through to the hostname with
-/// no lossy fold that could collide distinct names. The value is used as-is
-/// when it is a well-formed label (a defensive check, not a transform), and
-/// falls back to "container" only when no name was supplied.
+/// The container's hostname.
+///
+/// A normal boot uses the machine name supplied in the agent environment. A
+/// restored fork clone inherits that immutable process environment from its
+/// golden, but clone rejuvenation updates the VM's kernel hostname before it
+/// publishes `RESTORED_PATH`. Prefer that runtime hostname only after restore,
+/// so a recycled keep-alive container receives the clone's identity rather
+/// than recreating the golden's private UTS namespace.
 pub fn container_hostname() -> String {
-    std::env::var(smolvm_protocol::guest_env::MACHINE_NAME)
-        .ok()
-        .map(|name| name.trim().to_string())
-        .filter(|name| is_dns_label(name))
-        .unwrap_or_else(|| "container".to_string())
+    let restored = Path::new(smolvm_protocol::forkpoint::RESTORED_PATH).is_file();
+    let runtime = restored
+        .then(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .flatten();
+    let configured = std::env::var(smolvm_protocol::guest_env::MACHINE_NAME).ok();
+    resolve_container_hostname(restored, runtime.as_deref(), configured.as_deref())
+}
+
+fn resolve_container_hostname(
+    restored: bool,
+    runtime: Option<&str>,
+    configured: Option<&str>,
+) -> String {
+    restored
+        .then_some(runtime)
+        .flatten()
+        .into_iter()
+        .chain(configured)
+        .map(str::trim)
+        .find(|name| is_dns_label(name))
+        .unwrap_or("container")
+        .to_string()
 }
 
 /// Whether `s` is a lowercase DNS label usable verbatim as a hostname:
@@ -1218,6 +1251,27 @@ mod tests {
         assert!(!is_dns_label("-edge"));
         assert!(!is_dns_label("edge-"));
         assert!(!is_dns_label(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn restored_container_prefers_rejuvenated_runtime_hostname() {
+        assert_eq!(
+            resolve_container_hostname(true, Some("clone-7\n"), Some("golden")),
+            "clone-7"
+        );
+        assert_eq!(
+            resolve_container_hostname(false, Some("clone-7"), Some("golden")),
+            "golden"
+        );
+    }
+
+    #[test]
+    fn invalid_runtime_hostname_falls_back_to_configured_name() {
+        assert_eq!(
+            resolve_container_hostname(true, Some("NOT A LABEL"), Some("golden")),
+            "golden"
+        );
+        assert_eq!(resolve_container_hostname(true, None, None), "container");
     }
 
     use super::*;
@@ -1315,6 +1369,19 @@ mod tests {
             (kmsg.device_type.as_str(), kmsg.major, kmsg.minor),
             ("c", 1, 11)
         );
+
+        // /dev/fuse (10:229) must be there too, or a FUSE client the user
+        // brings (JuiceFS, s3fs, sshfs) cannot mount without mknod'ing it.
+        let fuse = spec
+            .linux
+            .devices
+            .iter()
+            .find(|d| d.path == "/dev/fuse")
+            .expect("/dev/fuse device present");
+        assert_eq!(
+            (fuse.device_type.as_str(), fuse.major, fuse.minor),
+            ("c", 10, 229)
+        );
     }
 
     #[test]
@@ -1357,6 +1424,25 @@ mod tests {
                 .is_none(),
             "consoleSize must be omitted when unset"
         );
+    }
+
+    #[test]
+    fn default_nofile_limit_supports_dependency_heavy_workloads() {
+        let spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+            false,
+        );
+        let limits = spec.process.rlimits.expect("default process limits");
+        let nofile = limits
+            .iter()
+            .find(|limit| limit.rlimit_type == "RLIMIT_NOFILE")
+            .expect("RLIMIT_NOFILE");
+        assert_eq!(nofile.soft, 1_048_576);
+        assert_eq!(nofile.hard, 1_048_576);
     }
 
     #[test]

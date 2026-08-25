@@ -452,6 +452,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub init_completed: bool,
 
+    /// Remote volumes (S3-compatible object stores) mounted inside the guest
+    /// by the agent on every start. See `crate::remote_volume`.
+    #[serde(default)]
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
+
     /// Environment variables for init commands.
     #[serde(default)]
     pub env: Vec<(String, String)>,
@@ -710,6 +715,7 @@ impl VmRecord {
             last_exit_code: None,
             init: Vec::new(),
             init_completed: false,
+            remote_volumes: Vec::new(),
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
@@ -780,6 +786,7 @@ impl VmRecord {
             last_exit_code: None,
             init: Vec::new(),
             init_completed: false,
+            remote_volumes: Vec::new(),
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
@@ -929,6 +936,35 @@ impl VmRecord {
                  `docker save {image} | smolvm machine create --image - ...`"
             ),
         ))
+    }
+
+    /// Remote volumes are mounted into the workload container's mount
+    /// namespace, so there has to be a container: refuse configurations that
+    /// can never mount at create instead of failing every start. Shared by the
+    /// CLI and API create paths.
+    pub fn validate_remote_volumes(&self) -> crate::Result<()> {
+        if self.remote_volumes.is_empty() {
+            return Ok(());
+        }
+        if self.image.is_none() {
+            return Err(crate::Error::config(
+                "create machine",
+                "remote volumes require an image machine: they are mounted into \
+                 the workload container's mount namespace",
+            ));
+        }
+        let plan = crate::network::plan_launch_network(
+            &self.vm_resources(),
+            self.dns_filter_hosts.as_deref(),
+            self.ports.len(),
+        );
+        if !plan.has_network() {
+            return Err(crate::Error::config(
+                "create machine",
+                "remote volumes need network access: add --net (or an egress policy)",
+            ));
+        }
+        Ok(())
     }
 
     /// Convert record fields to VmResources.

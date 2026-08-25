@@ -86,6 +86,50 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Attach to an existing machine, starting it only when it is not already
+    /// available. A frozen fork base is intentionally not agent-reachable: its
+    /// vCPUs are paused while its retained checkpoint backs future clones.
+    /// Treating that state as a stopped VM launches a second VMM over the same
+    /// disks and replaces its control socket, destroying the fork source.
+    pub fn connect_or_start_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.cached_handle(name)? {
+                if lock_handle(&handle)?.is_process_alive() {
+                    return Ok(());
+                }
+                self.remove_cached_handle(name)?;
+            }
+
+            let record = control::get_record(&self.db, name)?;
+            // The DB remains `Running` while a retained live-RAM checkpoint is
+            // paused; the shared state probe resolves its control-socket state
+            // to `Frozen`. Looking only at the stored enum misses the normal
+            // retained-snapshot case and starts a second VMM over the golden.
+            if crate::agent::state_probe::resolve_state(name, &record)
+                == crate::config::RecordState::Frozen
+            {
+                return Ok(());
+            }
+
+            if let Ok(handle) = control::connect_vm(&self.db, name) {
+                self.insert_handle(name, handle)?;
+                return Ok(());
+            }
+
+            let started = control::start_vm(&self.db, name)?;
+            let mut handle = started.handle;
+            if started.freshly_started {
+                if let Err(error) = self.launch_image_workload(name, &mut handle) {
+                    let _ = handle.stop();
+                    let _ = control::mark_stopped(&self.db, name);
+                    return Err(error);
+                }
+            }
+            self.insert_handle(name, handle)?;
+            Ok(())
+        })
+    }
+
     /// Start a persisted machine attached to a Kubernetes pod network namespace.
     /// The launcher bridges the guest virtio-net NIC to a tap inside `netns` so
     /// the pod carries its CNI-assigned IP (see [`control::start_vm_with_netns`]).
@@ -139,9 +183,45 @@ impl EmbeddedRuntime {
     /// remaps the golden's forwards to fresh host ports. The golden freezes as the
     /// shared base and must not be started again while clones exist.
     pub fn fork_machine(&self, golden: &str, clone: &str, ports: &[(u16, u16)]) -> Result<()> {
-        self.with_name_lock(clone, || {
+        self.with_name_locks(&[golden, clone], || {
             let handle = control::fork_vm(&self.db, golden, clone, ports)?;
             self.insert_handle(clone, handle)?;
+            Ok(())
+        })
+    }
+
+    /// Fork several clones from one retained snapshot and boot them with
+    /// bounded parallelism. All names are locked together so overlapping SDK
+    /// calls cannot race the golden freeze or claim the same clone name.
+    pub fn fork_machines(
+        &self,
+        golden: &str,
+        clones: &[String],
+        ports: &[(u16, u16)],
+        parallel: usize,
+    ) -> Result<()> {
+        let mut lock_names = Vec::with_capacity(clones.len() + 1);
+        lock_names.push(golden);
+        lock_names.extend(clones.iter().map(String::as_str));
+        self.with_name_locks(&lock_names, || {
+            let requests: Vec<_> = clones
+                .iter()
+                .map(|name| (name.clone(), ports.to_vec()))
+                .collect();
+            let mut started = control::fork_vm_batch(&self.db, golden, &requests, parallel)?;
+            let mut registry = match self.registry.write() {
+                Ok(registry) => registry,
+                Err(error) => {
+                    for (name, handle) in &mut started {
+                        let _ = handle.stop();
+                        let _ = control::delete_vm(&self.db, name);
+                    }
+                    return Err(Error::agent("runtime registry", error.to_string()));
+                }
+            };
+            for (name, handle) in started {
+                registry.insert(name, Arc::new(Mutex::new(handle)));
+            }
             Ok(())
         })
     }
@@ -156,7 +236,7 @@ impl EmbeddedRuntime {
         ports: &[(u16, u16)],
         share_weights: bool,
     ) -> Result<()> {
-        self.with_name_lock(clone, || {
+        self.with_name_locks(&[golden, clone], || {
             let handle = control::fork_vm_with_options(
                 &self.db,
                 golden,
@@ -243,6 +323,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_config(config)
             }
@@ -357,6 +438,21 @@ impl EmbeddedRuntime {
         handle.launch_image_workload(name, &record)
     }
 
+    /// The machine's remote volumes, resolved against its own recorded env.
+    ///
+    /// An exec is often what establishes the workload container — the machine's
+    /// command exited, or the image's own default was short-lived — and that
+    /// container is where the mount lives. Carrying the volumes on every exec
+    /// means the bucket is present in whichever container ends up serving the
+    /// session, instead of only when a long-running workload happens to survive.
+    fn s3_volumes_for(&self, name: &str) -> Result<Vec<smolvm_protocol::S3Volume>> {
+        let record = control::get_record(&self.db, name)?;
+        Ok(crate::remote_volume::to_s3_volumes(
+            &record.remote_volumes,
+            &record.env,
+        ))
+    }
+
     /// The machine's image, if it is an image (container-workload) machine.
     /// Streamed execs on such a machine must run inside its persistent container
     /// overlay so their writes survive — matching non-streaming exec.
@@ -405,6 +501,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_streaming_with(config, on_event)
             }
@@ -497,8 +594,21 @@ impl EmbeddedRuntime {
     where
         F: FnOnce() -> Result<T>,
     {
-        let lock = self.lock_for_name(name)?;
-        let _guard = lock_name(&lock)?;
+        self.with_name_locks(&[name], op)
+    }
+
+    fn with_name_locks<T, F>(&self, names: &[&str], op: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let mut names = names.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        let locks = names
+            .into_iter()
+            .map(|name| self.lock_for_name(name))
+            .collect::<Result<Vec<_>>>()?;
+        let _guards = locks.iter().map(lock_name).collect::<Result<Vec<_>>>()?;
         op()
     }
 
@@ -647,6 +757,26 @@ mod tests {
         assert_eq!(runtime.state("runtime-state"), "stopped");
         assert!(!runtime.is_running("runtime-state"));
         assert_eq!(runtime.pid("runtime-state"), None);
+    }
+
+    #[test]
+    fn reconnect_never_restarts_a_frozen_fork_base() {
+        let db = test_db();
+        let mut record = test_spec("frozen-checkpoint", true).to_record();
+        record.state = crate::config::RecordState::Frozen;
+        db.insert_vm_if_not_exists("frozen-checkpoint", &record)
+            .unwrap();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+
+        runtime
+            .connect_or_start_machine("frozen-checkpoint")
+            .unwrap();
+
+        assert_eq!(
+            db.get_vm("frozen-checkpoint").unwrap().unwrap().state,
+            crate::config::RecordState::Frozen
+        );
+        assert!(runtime.registry.read().unwrap().is_empty());
     }
 
     #[test]

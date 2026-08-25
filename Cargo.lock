@@ -1267,6 +1267,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -1399,7 +1400,7 @@ checksum = "0590c4a94da3372e83493b956755a6e2266830b6e4e3b101afe66e3f39477b91"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1999,6 +2000,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "home"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2102,7 +2112,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -2556,7 +2566,7 @@ dependencies = [
  "tracing",
  "url",
  "vergen-gitcl",
- "webpki-roots",
+ "webpki-roots 1.0.7",
  "ws_stream_wasm",
 ]
 
@@ -3271,9 +3281,9 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa7b5ccd819a9c68a0d955e67a881032d09b1a17219b1f90b0997a0888e1a15"
+checksum = "9a46813e306c29c4f86357b6ffa39a8e1c97bb274b9a296a19a56d62e4111225"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -3546,9 +3556,9 @@ dependencies = [
 
 [[package]]
 name = "papaya"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "997ee03cd38c01469a7046643714f0ad28880bcb9e6679ff0666e24817ca19b7"
+checksum = "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae"
 dependencies = [
  "equivalent",
  "seize",
@@ -4240,7 +4250,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -4563,10 +4573,6 @@ name = "seize"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "semver"
@@ -4830,7 +4836,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -4856,7 +4862,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -4918,7 +4924,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-agent"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -4931,6 +4937,7 @@ dependencies = [
  "serde_json",
  "smolvm-oci-layer",
  "smolvm-protocol",
+ "smolvm-s3fs",
  "tar",
  "tempfile",
  "tracing",
@@ -4956,19 +4963,20 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "libloading",
 ]
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.9.0"
+version = "1.12.0"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -4976,7 +4984,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -4985,7 +4993,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -4994,7 +5002,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "crossbeam-queue",
  "humantime",
@@ -5008,14 +5016,14 @@ dependencies = [
 
 [[package]]
 name = "smolvm-nvml-shim"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "smolvm-oci-layer"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "flate2",
  "libc",
@@ -5028,7 +5036,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "crc32fast",
  "dirs",
@@ -5047,7 +5055,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "base64",
  "serde",
@@ -5057,7 +5065,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.9.0"
+version = "1.12.0"
 dependencies = [
  "bytes",
  "dirs",
@@ -5075,6 +5083,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "smolvm-s3fs"
+version = "1.12.0"
+dependencies = [
+ "hmac",
+ "libc",
+ "sha2 0.10.9",
+ "tracing",
+ "ureq",
 ]
 
 [[package]]
@@ -5224,9 +5243,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.3"
+version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5863,6 +5882,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6217,6 +6252,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

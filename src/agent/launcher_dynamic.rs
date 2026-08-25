@@ -143,6 +143,10 @@ pub fn launch_agent_vm_dynamic(
     // SAFETY: Each FFI call below is individually wrapped in unsafe.
     // All CString/pointer construction is safe Rust outside the unsafe blocks.
 
+    if config.resources.gpu {
+        krun.ensure_gpu_runtime()?;
+    }
+
     // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug).
     // Honor SMOLVM_KRUN_LOG_LEVEL like the non-packed launcher so a packed VM's
     // boot can be traced; otherwise fall back to info under --debug.
@@ -206,6 +210,110 @@ pub fn launch_agent_vm_dynamic(
                     ));
                 }
                 tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+
+                // Optional virtio-gpu scanout. Venus gives the guest GPU
+                // *rendering*; a scanout gives it a *display*. Without one the
+                // device reports num_scanouts = 0, so the guest sees no
+                // connector and card0 is render-only — which is why DRM
+                // compositors fail with "not a KMS device". Opt-in for now:
+                // adding a connector changes guest topology, and existing GPU
+                // workloads (CUDA, headless Vulkan) neither need nor want one.
+                if let Some((w, h)) =
+                    super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
+                {
+                    super::default_gpu_backend_for_display();
+                    match krun.add_display {
+                        Some(add_display) => {
+                            let ret = unsafe { add_display(ctx, w, h) };
+                            if ret < 0 {
+                                free_ctx_on_err!(format!(
+                                    "krun_add_display({w}x{h}) failed (ret={ret})"
+                                ));
+                            }
+                            tracing::info!(
+                                width = w,
+                                height = h,
+                                display_id = ret,
+                                "virtio-gpu scanout added (guest gets a KMS connector)"
+                            );
+
+                            // A described display is not a usable one. With no
+                            // backend to consume frames libkrun installs a
+                            // no-op that fails every scanout call, so the
+                            // guest's first page flip never completes and a
+                            // compositor blocks on it forever.
+                            let Some(set_backend) = krun.set_display_backend else {
+                                free_ctx_on_err!(
+                                    "SMOLVM_DISPLAY set but this libkrun has no \
+                                     krun_set_display_backend; without it the guest \
+                                     would hang on its first page flip"
+                                );
+                            };
+                            let framebuffer = match crate::agent::display::install(set_backend, ctx)
+                            {
+                                Ok(fb) => fb,
+                                Err(e) => free_ctx_on_err!(e.to_string()),
+                            };
+
+                            // Serving RFB from the host means the guest needs
+                            // no capture tool and no compositor-specific
+                            // screencopy protocol.
+                            if let Some(bind) = std::env::var("SMOLVM_VNC")
+                                .ok()
+                                .as_deref()
+                                .and_then(crate::agent::vnc::parse_bind_addr)
+                            {
+                                // Input is best-effort: a libkrun without the
+                                // input feature degrades to view-only rather
+                                // than blocking the display.
+                                let input = match krun.add_input_device {
+                                    Some(add_input) => {
+                                        match crate::agent::input::install(add_input, ctx) {
+                                            Ok(i) => {
+                                                tracing::info!(
+                                                    "vnc input devices attached \
+                                                     (keyboard + pointer)"
+                                                );
+                                                Some(i)
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "vnc input unavailable; view-only"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::info!(
+                                            "libkrun has no krun_add_input_device; \
+                                             vnc is view-only"
+                                        );
+                                        None
+                                    }
+                                };
+                                match crate::agent::vnc::serve(&bind, framebuffer, input) {
+                                    Ok(addr) => {
+                                        tracing::info!(%addr, "vnc server listening")
+                                    }
+                                    // A failed viewer must not take down the
+                                    // VM; the display works without it.
+                                    Err(e) => tracing::warn!(
+                                        bind = %bind,
+                                        error = %e,
+                                        "vnc server failed to start"
+                                    ),
+                                }
+                            }
+                        }
+                        None => {
+                            free_ctx_on_err!(
+                                "SMOLVM_DISPLAY set but this libkrun has no krun_add_display"
+                            );
+                        }
+                    }
+                }
             }
             None => {
                 free_ctx_on_err!(

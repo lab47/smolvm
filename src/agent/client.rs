@@ -125,6 +125,24 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// likely already torn down — safe to proceed with SIGTERM.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
 
+/// Default read window for a guest-side flatten (overlay merge + tar of tens
+/// of GiB to the guest disk). The guest stays quiet while tar runs, so the
+/// window must cover the whole tar, not just the mount. Pack size is
+/// unbounded, so a fixed window cannot cover every pack — raise it for very
+/// large packs with `SMOLVM_FLATTEN_TIMEOUT_SECS`.
+const FLATTEN_TIMEOUT_DEFAULT_SECS: u64 = 900;
+
+/// Resolve the flatten read window, honoring `SMOLVM_FLATTEN_TIMEOUT_SECS`
+/// (seconds, must be > 0). Falls back to [`FLATTEN_TIMEOUT_DEFAULT_SECS`].
+fn flatten_timeout() -> Duration {
+    let secs = std::env::var("SMOLVM_FLATTEN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(FLATTEN_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
 // ============================================================================
 // I/O Constants
 // ============================================================================
@@ -434,6 +452,10 @@ pub struct RunConfig {
     /// Run as an unprivileged container (restricted caps, ro cgroup, no extra
     /// tmpfs). Default false = "VM-grade" (the microVM is the boundary).
     pub unprivileged: bool,
+    /// Remote-volume mount script to run inside the workload container before
+    /// its (image-resolved) command. Set by the workload launcher; the agent
+    /// wraps the resolved command so the image's real entrypoint still runs.
+    pub s3_volumes: Vec<smolvm_protocol::S3Volume>,
 }
 
 impl RunConfig {
@@ -455,7 +477,60 @@ impl RunConfig {
             persistent_overlay_id: None,
             stdin: None,
             unprivileged: false,
+            s3_volumes: Vec::new(),
         }
+    }
+
+    /// Target an existing machine: the overlay it runs in AND the buckets it
+    /// mounts, which must travel together.
+    ///
+    /// These two facts were previously set independently at ~15 launch and exec
+    /// sites, and a site that set the overlay but forgot the volumes produced a
+    /// workload running in the right filesystem with its bucket silently
+    /// missing — an empty directory, not an error. Binding them to one call
+    /// means a site either targets a machine completely or not at all, and a
+    /// future per-machine fact is added here rather than at every caller.
+    ///
+    /// `env` is the environment the machine will actually see (request env and
+    /// resolved secrets merged over the record's), because that is where the
+    /// bucket credentials come from.
+    pub fn in_machine(
+        mut self,
+        record: &crate::config::VmRecord,
+        machine_name: &str,
+        env: &[(String, String)],
+    ) -> Self {
+        // A caller with no env of its own (an interactive session, say) still
+        // needs the machine's credentials, which live on the record.
+        let env = if env.is_empty() { &record.env } else { env };
+        self.s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, env);
+        self.persistent_overlay_id = Some(crate::workload::persistent_overlay_owner(
+            machine_name,
+            record.golden.as_deref(),
+        ));
+        self
+    }
+
+    /// [`Self::in_machine`] for callers holding an optional record.
+    ///
+    /// A machine with no record (an ephemeral or bare-VM session) simply keeps
+    /// the config as-is, so a caller never has to branch on it.
+    pub fn in_machine_opt(
+        self,
+        record: Option<&crate::config::VmRecord>,
+        machine_name: &str,
+        env: &[(String, String)],
+    ) -> Self {
+        match record {
+            Some(record) => self.in_machine(record, machine_name, env),
+            None => self,
+        }
+    }
+
+    /// Set the remote-volume mount script run inside the workload container.
+    pub fn with_s3_volumes(mut self, volumes: Vec<smolvm_protocol::S3Volume>) -> Self {
+        self.s3_volumes = volumes;
+        self
     }
 
     /// Set environment variables.
@@ -652,6 +727,20 @@ pub struct AgentClient {
     stream: UdsStream,
     /// Trace ID for correlating this client session's requests with host API calls.
     trace_id: Option<String>,
+}
+
+fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
+    if bytes_read == 0 && propagate_initial_wouldblock {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "timed out waiting for an agent response frame",
+        )
+    } else {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out reading frame body: peer stalled mid-frame",
+        )
+    }
 }
 
 // ============================================================================
@@ -1182,6 +1271,12 @@ impl AgentClient {
     /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
     pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
+        // Merging the lower dirs and tarring the result runs for minutes on a
+        // large base, and the agent sends nothing in between — far past the
+        // default read timeout, which surfaces as a spurious EAGAIN. Widen the
+        // window for the whole flatten, as the file-read paths do for large
+        // transfers. Configurable because pack size is unbounded.
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
         let resp = self.request(&AgentRequest::FlattenLayers {
             lowerdirs: lowerdirs.to_vec(),
             output: output.to_string(),
@@ -1553,6 +1648,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: config.stdin,
             background: false,
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         expect_completed(resp, "run command")
@@ -1579,6 +1675,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: true,
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -1622,6 +1719,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -1659,6 +1757,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                s3_volumes: config.s3_volumes.clone(),
             },
             tty,
             "run interactive",
@@ -1697,6 +1796,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            s3_volumes: config.s3_volumes,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -1932,6 +2032,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                s3_volumes: config.s3_volumes.clone(),
             },
             input,
             on_output,
@@ -2389,6 +2490,43 @@ impl AgentClient {
 
         let mut pos = 0;
         while pos < buf.len() {
+            // SO_RCVTIMEO is normally enough to bound a blocking read, but a
+            // restored vsock/UDS bridge can occasionally leave recv() blocked
+            // past that socket timeout while many clones reconnect at once.
+            // Poll the descriptor against the same idle deadline before every
+            // read on Unix so a missing response cannot pin a fork-batch worker
+            // forever. A readable event also covers EOF/error; read() below
+            // preserves the precise result in those cases.
+            #[cfg(unix)]
+            if let Some(d) = deadline {
+                let mut pollfd = libc::pollfd {
+                    fd: std::os::unix::io::AsRawFd::as_raw_fd(&self.stream),
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                };
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= d {
+                        return Err(stalled_read_error(pos, propagate_initial_wouldblock));
+                    }
+                    let remaining = d.saturating_duration_since(now);
+                    let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+                    // SAFETY: `pollfd` points to one initialized entry for the
+                    // duration of the call; poll does not retain the pointer.
+                    let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+                    if ready > 0 {
+                        break;
+                    }
+                    if ready == 0 {
+                        return Err(stalled_read_error(pos, propagate_initial_wouldblock));
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
             match self.stream.read(&mut buf[pos..]) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -2413,10 +2551,7 @@ impl AgentClient {
                     // can't busy-spin forever.
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "timed out reading frame body: peer stalled mid-frame",
-                            ));
+                            return Err(stalled_read_error(pos, propagate_initial_wouldblock));
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3349,6 +3484,33 @@ mod stalled_body_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn receive_times_out_when_peer_never_starts_a_frame() {
+        let (client_stream, server_stream) = UdsStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            drop(server_stream);
+        });
+        let mut client = AgentClient::from_stream(client_stream);
+
+        let start = Instant::now();
+        let error = client
+            .receive()
+            .expect_err("an idle peer must not block receive forever");
+        let elapsed = start.elapsed();
+
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "an idle response must honor the socket deadline (got {elapsed:?})"
+        );
+        server.join().expect("server thread joined");
+    }
+
+    #[test]
     fn receive_times_out_on_stalled_mid_frame_body() {
         let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
 
@@ -3472,5 +3634,54 @@ mod term_default_tests {
         let env = with_term_default(vec![("A".to_string(), "b".to_string())], false);
         assert_eq!(term_of(&env), None);
         assert_eq!(env.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod flatten_timeout_tests {
+    use super::*;
+
+    // `set_var`/`remove_var` are process-global and the tests run in parallel
+    // threads; serialize them so one test's override can't bleed into another.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env(value: Option<&str>, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        match value {
+            Some(v) => std::env::set_var("SMOLVM_FLATTEN_TIMEOUT_SECS", v),
+            None => std::env::remove_var("SMOLVM_FLATTEN_TIMEOUT_SECS"),
+        }
+        f();
+        std::env::remove_var("SMOLVM_FLATTEN_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn defaults_to_900_seconds_without_env() {
+        with_env(None, || {
+            assert_eq!(
+                flatten_timeout(),
+                Duration::from_secs(FLATTEN_TIMEOUT_DEFAULT_SECS)
+            );
+        });
+    }
+
+    #[test]
+    fn honors_a_valid_override() {
+        with_env(Some("3600"), || {
+            assert_eq!(flatten_timeout(), Duration::from_secs(3600));
+        });
+    }
+
+    #[test]
+    fn rejects_zero_unparsable_and_empty_values() {
+        for bad in ["0", "-5", "abc", "", "  "] {
+            with_env(Some(bad), || {
+                assert_eq!(
+                    flatten_timeout(),
+                    Duration::from_secs(FLATTEN_TIMEOUT_DEFAULT_SECS),
+                    "value {bad:?} must fall back to the default"
+                );
+            });
+        }
     }
 }

@@ -2,8 +2,9 @@
 # smolvm installer
 #
 # CANONICAL SOURCE: scripts/install.sh in the smolvm repo
-# The website copy at smolmachines/docs/public/install.sh must be kept in sync.
-# After editing this file, copy it to smolmachines/docs/public/install.sh
+# The website copy at smolmachines/static/install.sh (served at
+# https://smolmachines.com/install.sh) must be kept in sync.
+# After editing this file, copy it verbatim to smolmachines/static/install.sh.
 #
 # Usage:
 #   curl -sSL https://smolmachines.com/install.sh | bash
@@ -342,6 +343,18 @@ install_smolvm() {
         rm -rf "$prefix/lib"
     elif [[ -d "$prefix/lib" ]]; then
         warn "$prefix/lib exists but no .version file found — skipping lib/ removal"
+        warn "If this is a previous smolvm install, remove it manually first"
+    fi
+    # An older layout bundled agent-rootfs next to the binary, and the wrapper
+    # prefers that copy over the one in the data directory. Upgrades refresh the
+    # data-dir copy but left this one in place, so a new binary kept booting a
+    # stale agent — which silently ignores request fields it does not know (a
+    # remote volume, say) rather than failing. Remove it so the wrapper falls
+    # through to the rootfs this install actually wrote.
+    if [[ -d "$prefix/agent-rootfs" ]] && [[ -f "$prefix/.version" ]]; then
+        rm -rf "$prefix/agent-rootfs"
+    elif [[ -d "$prefix/agent-rootfs" ]]; then
+        warn "$prefix/agent-rootfs exists but no .version file found — skipping removal"
         warn "If this is a previous smolvm install, remove it manually first"
     fi
     if [[ -f "$prefix/smolvm" ]]; then

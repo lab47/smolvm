@@ -340,8 +340,8 @@ impl PackCreateCmd {
             &mut client,
             &image,
             pack_config.oci_platform.as_deref(),
-            self.proxy_opts.proxy(),
-            self.proxy_opts.no_proxy(),
+            self.proxy_opts.resolved_proxy()?.as_deref(),
+            self.proxy_opts.no_proxy().as_deref(),
         )?;
         debug!(image_info = ?image_info, "image pulled");
 
@@ -542,6 +542,22 @@ impl PackCreateCmd {
             ));
         }
 
+        // The pack format has no notion of remote volumes; packing quietly
+        // producing an artifact without them would look like data loss at run
+        // time, so say it up front.
+        if !vm.remote_volumes.is_empty() {
+            warn!(
+                "VM '{}' has remote volumes ({}); .smolmachine artifacts do not carry them — \
+                 re-attach with -v when creating machines from this artifact",
+                vm_name,
+                vm.remote_volumes
+                    .iter()
+                    .map(|v| v.target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 2. Create temporary staging directory
@@ -559,8 +575,8 @@ impl PackCreateCmd {
         // single-layer flatten).
         self.collect_base_assets(&mut collector)?;
         let export_opts = smolvm::pack_export::FromVmExportOptions {
-            proxy: self.proxy_opts.proxy().map(str::to_string),
-            no_proxy: self.proxy_opts.no_proxy().map(str::to_string),
+            proxy: self.proxy_opts.resolved_proxy()?,
+            no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(

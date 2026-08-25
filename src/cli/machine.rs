@@ -55,6 +55,30 @@ fn is_likely_image_ref(s: &str) -> bool {
     s.contains('/') && !s.starts_with('/') && !s.starts_with("./") && !s.starts_with("../")
 }
 
+/// `machine create`'s own long options that appear in a workload command, i.e.
+/// after the `--` separator, where they are arguments for the guest process
+/// rather than machine options.
+///
+/// Short flags are deliberately ignored: `-v`, `-e` and `-p` are far too common
+/// in ordinary commands to name without drowning the real signal. The long
+/// options come from clap itself, so a newly added flag is covered without
+/// touching this list.
+fn create_flags_in_workload(command: &[String]) -> Vec<String> {
+    use clap::Args as _;
+    let spec = CreateCmd::augment_args(clap::Command::new("create"));
+    let longs: std::collections::HashSet<String> = spec
+        .get_arguments()
+        .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        .collect();
+    let mut found: Vec<String> = Vec::new();
+    for word in command {
+        if longs.contains(word.as_str()) && !found.contains(word) {
+            found.push(word.clone());
+        }
+    }
+    found
+}
+
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
     allow_host: Vec<String>,
@@ -573,11 +597,15 @@ pub struct RunCmd {
     #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB", help_heading = "Resources")]
     pub mem: u32,
 
-    /// Storage disk size in GiB
+    /// Writable data disk size in GiB (default 20). Bounds how much a workload
+    /// can write: a disk-heavy or untrusted command fills this disk (ENOSPC),
+    /// never the host. This is the flag to lower when sandboxing untrusted code.
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub storage: Option<u64>,
 
-    /// Overlay disk size in GiB
+    /// Container rootfs overlay (copy-on-write upper layer) size in GiB. NOT the
+    /// writable-data cap — use --storage to bound how much a workload can write.
+    /// Rarely needs setting.
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub overlay: Option<u64>,
 
@@ -803,6 +831,27 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+/// Build the bake's `machine start` argv, forwarding the run's `--proxy` /
+/// `--no-proxy` so the one-time init pull reaches the registry through the same
+/// proxy the outer run uses. Without this, a Smolfile with `init` steps pulls
+/// direct in the bake and times out on a proxy-only network.
+fn bake_start_args<'a>(
+    tmp: &'a str,
+    proxy: Option<&'a str>,
+    no_proxy: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut start = vec!["machine", "start", "--name", tmp];
+    if let Some(p) = proxy {
+        start.push("--proxy");
+        start.push(p);
+    }
+    if let Some(n) = no_proxy {
+        start.push("--no-proxy");
+        start.push(n);
+    }
+    start
+}
+
 /// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
 /// return its path. Runs the well-tested `machine create/start/stop` + `pack create
 /// --from-vm` flow as subprocesses of this same binary: create a temp machine from
@@ -814,6 +863,8 @@ fn ensure_init_layer(
     smolfile: Option<&Path>,
     rebuild: bool,
     digest: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> smolvm::Result<PathBuf> {
     // The bake here only ever receives a registry image: `ensure_init_layer` is
     // gated on `image_bakeable()` (local archives/dirs take the direct path),
@@ -928,7 +979,12 @@ fn ensure_init_layer(
 
         println!("  · pulling image and running init...");
         run_smolvm(&exe, &create)?;
-        run_smolvm(&exe, &["machine", "start", "--name", &tmp])?;
+        // The image pull happens at `start`; forward the run's proxy so the
+        // bake reaches the registry through a corporate/loopback proxy too —
+        // otherwise a Smolfile with `init` steps pulls direct and times out
+        // even when the outer run was given --proxy.
+        let start = bake_start_args(&tmp, proxy, no_proxy);
+        run_smolvm(&exe, &start)?;
         run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
         println!("  · snapshotting...");
         run_smolvm(
@@ -1242,6 +1298,8 @@ impl RunCmd {
                 self.smolfile.as_deref(),
                 self.rebuild_init_cache,
                 resolved_digest.as_deref(),
+                self.proxy_opts.resolved_proxy()?.as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             )?;
             // The real workload: CLI trailing args win, else the Smolfile's
             // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
@@ -1287,7 +1345,18 @@ impl RunCmd {
             .run();
         }
 
-        let mut mounts = HostMount::parse(&params.volume)?;
+        // Remote volumes are mounted inside the guest by the agent, so peel them
+        // off before the host-directory parse, which would reject an `s3://`
+        // source as a missing directory.
+        let (host_volume_specs, remote_volumes) =
+            smolvm::remote_volume::split_specs(&params.volume)?;
+        let mut mounts = HostMount::parse(&host_volume_specs)?;
+        if !remote_volumes.is_empty() && !params.net {
+            return Err(Error::config(
+                "machine run",
+                "remote volumes need network access to reach the bucket: add --net",
+            ));
+        }
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
             .map_err(|e| smolvm::Error::config("validate ports", e))?;
@@ -1550,8 +1619,8 @@ impl RunCmd {
                 &mut client,
                 img,
                 effective_platform.as_deref(),
-                self.proxy_opts.proxy(),
-                self.proxy_opts.no_proxy(),
+                self.proxy_opts.resolved_proxy()?.as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             ) {
                 Ok(info) => Some(info),
                 Err(e) if !params.net => {
@@ -1667,6 +1736,10 @@ impl RunCmd {
                 &env,
                 params.workdir.as_deref(),
             );
+            // Credentials and endpoint come from the workload's own env, the
+            // same place every AWS SDK reads them, so a remote volume needs no
+            // configuration beyond the `-v` spec and the usual variables.
+            let s3_volumes = smolvm::remote_volume::to_s3_volumes(&remote_volumes, &defaults.env);
             if self.detach {
                 // Start the main workload container first. If this fails, the
                 // VM is stopped and no DB record is written — a retry won't
@@ -1678,7 +1751,8 @@ impl RunCmd {
                         .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings.clone())
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     client.run_container_detached(run_config)?;
                 }
 
@@ -1793,7 +1867,8 @@ impl RunCmd {
                         .with_timeout(self.timeout)
                         .with_tty(tty)
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
@@ -1803,7 +1878,8 @@ impl RunCmd {
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
@@ -1989,6 +2065,41 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bake_start_forwards_proxy_when_set() {
+        // No proxy: plain start.
+        assert_eq!(
+            super::bake_start_args("t", None, None),
+            ["machine", "start", "--name", "t"]
+        );
+        // Proxy only.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://host.smolvm.internal:8118"), None),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://host.smolvm.internal:8118"
+            ]
+        );
+        // Proxy + no_proxy.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://p:3128"), Some("localhost,.internal")),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://p:3128",
+                "--no-proxy",
+                "localhost,.internal"
+            ]
+        );
+    }
+
     #[test]
     fn cp_mode_parses_common_octal_forms_and_rejects_garbage() {
         assert_eq!(super::parse_octal_mode("644").unwrap(), 0o644);
@@ -2372,6 +2483,49 @@ mod tests {
         assert!(is_likely_image_ref(&cmd.command[0]));
     }
 
+    // Machine options after `--` are workload arguments; clap cannot reject
+    // them, so they must at least be named.
+    #[test]
+    fn create_flags_after_separator_are_detected() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "x",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep infinity",
+            "--mem",
+            "32768",
+            "--storage",
+            "120",
+            "--net",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        // They configured nothing: the machine still has the defaults.
+        assert_eq!(cmd.mem, DEFAULT_MICROVM_MEMORY_MIB);
+        assert_eq!(cmd.storage, None);
+        assert!(!cmd.net);
+        assert_eq!(
+            create_flags_in_workload(&cmd.command),
+            ["--mem", "--storage", "--net"]
+        );
+    }
+
+    #[test]
+    fn create_workload_own_options_are_not_reported() {
+        // A workload's own long options are not machine options, and short
+        // flags are never reported — `-v`, `-e` and `-p` are too common.
+        let words: Vec<String> = ["myserver", "--listen", "0.0.0.0", "-v", "-e", "-p", "8080"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(create_flags_in_workload(&words).is_empty());
+    }
+
     #[test]
     fn create_accepts_trailing_workload_command() {
         let cli = TestMachineCli::parse_from([
@@ -2619,12 +2773,24 @@ impl ExecCmd {
             // Fork clones address the golden's inherited overlay; ordinary
             // machines use their own name.
             let overlay_owner = persistent_overlay_owner_for_record(&name, record.as_ref());
+            // An exec may be what establishes the workload container — the
+            // machine's command exited, or the image's own default was
+            // short-lived — and that container is where the mount lives. Carry
+            // the machine's volumes so the bucket is in whichever container
+            // serves this session, not only when a long-running workload
+            // happened to survive.
+            let exec_s3_volumes = record
+                .as_ref()
+                .map(|r| smolvm::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+                .unwrap_or_default();
             if self.detach {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env)
                     .with_workdir(defaults.workdir)
                     .with_user(defaults.user)
                     .with_mounts(mount_bindings)
+                    .with_s3_volumes(exec_s3_volumes.clone())
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner));
                 let pid = client.run_background(config)?;
                 println!("{pid}");
@@ -2638,6 +2804,7 @@ impl ExecCmd {
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner.clone()));
                 let exit_code = client.run_interactive(config)?;
                 std::process::exit(exit_code);
@@ -2650,6 +2817,7 @@ impl ExecCmd {
                     .with_user(defaults.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner.clone()));
                 let mut printer = ExecEventPrinter::default();
                 client.run_streaming_with(config, |event| printer.handle(event))?;
@@ -2662,6 +2830,7 @@ impl ExecCmd {
                 .with_user(defaults.user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
+                .with_s3_volumes(exec_s3_volumes.clone())
                 .with_persistent_overlay(Some(overlay_owner));
             let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
@@ -2837,8 +3006,13 @@ pub struct CreateCmd {
     #[arg(long, value_name = "GiB")]
     pub overlay: Option<u64>,
 
-    /// Mount host directory (can be used multiple times)
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Mount host directory (can be used multiple times). Also accepts
+    /// S3-compatible object storage, mounted inside the guest on every start:
+    /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
+    /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
+    /// for R2/MinIO; anonymous without them). Nothing is required of the
+    /// image: the agent performs the mount itself.
+    #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
     pub volume: Vec<String>,
 
     /// Expose port from VM to host (can be used multiple times)
@@ -2968,6 +3142,26 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // Everything after `--` is the workload, so machine options written
+        // there are handed to the guest command and quietly do not configure the
+        // machine — a swallowed `--mem`/`--storage` boots a machine at the
+        // defaults with no diagnostic. Rejecting them is not an option (a
+        // workload may legitimately take an option of the same name), so name
+        // them. Checked before the `--from` branch so both create paths warn.
+        let stray_flags = create_flags_in_workload(&self.command);
+        if !stray_flags.is_empty() {
+            eprintln!(
+                "note: {} came after `--`, so {} passed to the workload and did not \
+                 configure the machine. Machine options go before `--`.",
+                stray_flags.join(", "),
+                if stray_flags.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                }
+            );
+        }
+
         // --max-image-size raises the archive cap for this invocation by setting
         // the env var the resolver reads (image_source::max_archive_bytes).
         if let Some(bytes) = self.max_image_size {
@@ -3463,7 +3657,7 @@ impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        let proxy = self.proxy_opts.proxy();
+        let proxy = self.proxy_opts.resolved_proxy()?;
         let no_proxy = self.proxy_opts.no_proxy();
         // Forkable start: memfd-back guest RAM and register a control socket at a
         // known path so `machine fork` can later freeze this machine as a CoW base.
@@ -3476,13 +3670,17 @@ impl StartCmd {
             vm_common::ForkLaunch::default()
         };
         match vm_common::start_vm_named(
-            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+            &name,
+            proxy.as_deref(),
+            no_proxy.as_deref(),
+            /* from_snapshot */ false,
+            fork,
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
                 // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default(proxy, no_proxy)
+                vm_common::start_vm_default(proxy.as_deref(), no_proxy.as_deref())
             }
             Err(e) => Err(e),
         }
